@@ -236,6 +236,7 @@ def retrain_stale_baselines(
     """Check all window keys and retrain any baselines that need refreshing."""
     window_keys = discover_window_keys(redis_connection)
     retrained = 0
+    failures: list[tuple[str, str, str, Exception]] = []
     for scope, scope_id, config_type in window_keys:
         if should_retrain(redis_connection, scope, scope_id, config_type):
             try:
@@ -243,13 +244,20 @@ def retrain_stale_baselines(
                     redis_connection, db_connection, scope, scope_id, config_type
                 )
                 retrained += 1
-            except Exception:
+            except Exception as exception:
                 logger.error(
                     "Baseline refresh failed for %s:%s:%s", scope, scope_id, config_type,
                     exc_info=True,
                 )
+                failures.append((scope, scope_id, config_type, exception))
     if retrained > 0:
         logger.info("Retrained %d / %d baselines this tick", retrained, len(window_keys))
+    if failures:
+        logger.warning(
+            "%d baseline refresh(es) failed: %s",
+            len(failures),
+            ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct, _ in failures),
+        )
 
 
 def score_all_rows(
@@ -259,13 +267,21 @@ def score_all_rows(
 ) -> list[ScoredEvent]:
     """Score each telemetry row, returning only successfully scored events."""
     scored_events = []
+    failures: list[tuple[int | None, Exception]] = []
     for row in telemetry_rows:
         try:
             scored = score_row_with_cache(row, scope_map, model_cache)
             if scored is not None:
                 scored_events.append(scored)
-        except Exception:
+        except Exception as exception:
             logger.error("Scoring failed for row id=%s", row.get("id"), exc_info=True)
+            failures.append((row.get("id"), exception))
+    if failures:
+        logger.warning(
+            "%d row(s) failed scoring: %s",
+            len(failures),
+            ", ".join(str(row_id) for row_id, _ in failures),
+        )
     return scored_events
 
 
@@ -312,7 +328,7 @@ def run_single_tick(
 
 def run() -> None:
     logger.info("Connecting to PostgreSQL and Redis")
-    db_connection = psycopg2.connect(config.DB_DSN)
+    db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )

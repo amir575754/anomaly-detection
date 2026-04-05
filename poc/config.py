@@ -3,7 +3,7 @@
 # ---------------------------------------------------------------------------
 
 # PostgreSQL connection string
-DB_DSN: str = "postgresql://anomaly:anomaly@localhost:5432/anomaly"
+DATABASE_DSN: str = "postgresql://anomaly:anomaly@localhost:5432/anomaly"
 
 # Kafka broker address
 KAFKA_BOOTSTRAP: str = "localhost:9092"

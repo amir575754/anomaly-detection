@@ -136,7 +136,7 @@ def consume_loop(
 def connect_infrastructure() -> tuple[psycopg2.extensions.connection, redis_module.Redis, Consumer]:
     """Establish connections to PostgreSQL, Redis, and Kafka."""
     logger.info("Connecting to PostgreSQL, Redis, and Kafka")
-    db_connection = psycopg2.connect(config.DB_DSN)
+    db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )

@@ -446,7 +446,7 @@ Dashboard reads directly from PostgreSQL `alerts` on each poll. No additional in
 - **Naming:** no abbreviations or shortcuts. `program` not `prog`, `feature_name` not `feat`. Names should read like prose.
 - **Comments:** only for non-obvious decisions (e.g. why `k=2.5`). Do not comment what the code does; write code that says what it does.
 - **Configuration:** all tunable constants live in `config.py` at the repo root with descriptive names and a one-line comment explaining what each controls.
-- **Error handling:** fail loudly. Raise exceptions rather than swallowing errors. Log the exception and enough context to reproduce it.
+- **Error handling:** fail loudly. Raise exceptions rather than swallowing errors. Log the exception and enough context to reproduce it. In long-running loops (detector ticks), log errors at WARNING/ERROR level with full context; only raise if the failure is unrecoverable (e.g. scoring pipeline broken).
 
 ---
 

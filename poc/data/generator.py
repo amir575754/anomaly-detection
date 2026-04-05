@@ -141,7 +141,7 @@ def wait_for_ingestor(expected_count: int, timeout_seconds: int | None = None) -
     """Block until PostgreSQL telemetry row count reaches expected_count."""
     if timeout_seconds is None:
         timeout_seconds = config.INGESTOR_WAIT_TIMEOUT_SECONDS
-    db_connection = psycopg2.connect(config.DB_DSN)
+    db_connection = psycopg2.connect(config.DATABASE_DSN)
     deadline = time.time() + timeout_seconds
     last_logged_at = 0.0
     target = int(expected_count * config.INGESTOR_COMPLETION_THRESHOLD)
@@ -179,7 +179,7 @@ def parse_window_key(raw_key: bytes) -> tuple[str, str, str] | None:
 
 def save_baseline_cursor() -> None:
     """Store the current max telemetry ID so the detector knows where live data starts."""
-    db_connection = psycopg2.connect(config.DB_DSN)
+    db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
@@ -195,7 +195,7 @@ def save_baseline_cursor() -> None:
 def bootstrap_baselines() -> None:
     """Refresh baselines for all window keys populated during ingestion."""
     logger.info("Connecting to PostgreSQL and Redis for baseline bootstrap")
-    db_connection = psycopg2.connect(config.DB_DSN)
+    db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False
     )
@@ -317,7 +317,7 @@ def run_live_phase(producer: Producer, implants: list[tuple[str, str]]) -> None:
                 producer.flush()
                 log_live_summary(total_published, total_anomalies, "reached event cap")
                 return
-            if total_published % 1000 == 0:
+            if total_published % config.INGESTOR_LOG_INTERVAL_MESSAGES == 0:
                 producer.flush()
                 log_live_summary(total_published, total_anomalies, "progress")
     except KeyboardInterrupt:

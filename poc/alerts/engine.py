@@ -301,7 +301,7 @@ def apply_label(
         return
 
     logger.debug("Label %r applied to alert %s (pattern_hash=%s)", label.value, alert_id, row[0])
-    if label in (Label.FALSE_POSITIVE, Label.EXPECTED_DEVIATION):
+    if label == Label.FALSE_POSITIVE:
         _check_and_suppress_pattern(db_connection, row[0])
 
 
@@ -318,7 +318,7 @@ def _check_and_suppress_pattern(
             """
             SELECT COUNT(*) FROM alerts
             WHERE details->>'pattern_hash' = %s
-              AND label IN ('false_positive', 'expected_deviation')
+              AND label = 'false_positive'
             """,
             (pattern_hash,),
         )
