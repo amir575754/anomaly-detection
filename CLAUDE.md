@@ -106,7 +106,6 @@ poc/
 | Config Type | Key Fields |
 |-------------|------------|
 | `dangerous_program_configuration` | `dangerous_programs[]`, `dangerous_drivers[]` — each entry has `name` and `action` |
-| `internet_configuration` | `is_air_gapped` (bool) |
 | `communication_configuration` | `beacon_interval_ms`, `jitter_percentage`, `c2_channels[]`, `encryption{}` |
 | `persistence_configuration` | `active_methods[]`, `registry_key_count`, `scheduled_task_count` |
 | `capability_configuration` | `capabilities[]` with `enabled` flags, `max_concurrent_tasks` |
@@ -133,20 +132,6 @@ poc/
       { "name": "csagent.sys", "action": "audit" },
       { "name": "csfalcondrv.sys", "action": "self_destruct" }
     ]
-  }
-}
-```
-
-**`internet_configuration`:**
-```json
-{
-  "metadata": {
-    "implant_id": 1337,
-    "received_at": "25-03-2026 22:36:02",
-    "type": "internet_configuration"
-  },
-  "configuration": {
-    "is_air_gapped": false
   }
 }
 ```
@@ -187,9 +172,6 @@ Feature extraction is implemented in `extractor.py` (provided). The `extract_fea
 
 **`dangerous_program_configuration`:**
 `program_count`, `driver_count`, `total_entries`, `prog_audit_count`, `prog_self_destruct_count`, `prog_do_nothing_count`, `prog_self_destruct_ratio`, `drv_audit_count`, `drv_self_destruct_count`, `drv_do_nothing_count`, `drv_do_nothing_ratio`
-
-**`internet_configuration`:**
-`is_air_gapped`
 
 **`communication_configuration`:**
 `beacon_interval_ms`, `jitter_percentage`, `max_retries`, `sleep_on_failure_ms`, `c2_channel_count`, `c2_enabled_count`, `c2_unique_protocols`, `c2_non_standard_ports`, `encryption_enabled`, `key_rotation_hours`

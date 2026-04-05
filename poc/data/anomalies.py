@@ -41,15 +41,6 @@ def inject_self_destruct_flood(snapshot: dict) -> dict:
     return result
 
 
-def inject_air_gap_flip(snapshot: dict) -> dict:
-    """Enable air-gap mode — unusual for an active implant and worth investigating."""
-    result = copy.deepcopy(snapshot)
-    result["configuration"]["is_air_gapped"] = True
-    result["ground_truth"]["is_anomaly"] = True
-    result["ground_truth"]["injector_tag"] = "air_gap_flip"
-    return result
-
-
 def inject_capability_explosion(snapshot: dict) -> dict:
     """Enable all capabilities simultaneously and inflate concurrency limit."""
     result = copy.deepcopy(snapshot)
@@ -86,7 +77,6 @@ def inject_persistence_spike(snapshot: dict) -> dict:
 _INJECTORS_BY_CONFIG_TYPE = {
     "communication_configuration": [inject_beacon_storm, inject_zero_jitter],
     "dangerous_program_configuration": [inject_self_destruct_flood],
-    "internet_configuration": [inject_air_gap_flip],
     "capability_configuration": [inject_capability_explosion],
     "evasion_configuration": [inject_full_evasion],
     "persistence_configuration": [inject_persistence_spike],

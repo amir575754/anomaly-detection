@@ -86,8 +86,8 @@ RETRAIN_THRESHOLD: int = 100
 # Detection engine
 # ---------------------------------------------------------------------------
 
-# Config types excluded from anomaly detection (too few features for meaningful scoring)
-DETECTION_EXCLUDED_CONFIG_TYPES: list[str] = ["internet_configuration"]
+# Config types excluded from anomaly detection
+DETECTION_EXCLUDED_CONFIG_TYPES: list[str] = []
 
 # Nominal detection batch window in minutes (used for alert window labeling)
 DETECTION_WINDOW_MINUTES: int = 5

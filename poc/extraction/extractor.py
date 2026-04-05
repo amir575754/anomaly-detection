@@ -9,7 +9,6 @@ def extract_features(configuration: dict, config_type: str) -> dict[str, float]:
     """Return a flat feature vector for the given config type."""
     extractors = {
         "dangerous_program_configuration": _extract_dangerous_program,
-        "internet_configuration": _extract_internet,
         "communication_configuration": _extract_communication,
         "persistence_configuration": _extract_persistence,
         "capability_configuration": _extract_capability,
@@ -60,12 +59,6 @@ def _extract_dangerous_program(configuration: dict) -> dict[str, float]:
     features.update(_extract_program_features(programs, "prog"))
     features.update(_extract_program_features(drivers, "drv"))
     return features
-
-
-def _extract_internet(configuration: dict) -> dict[str, float]:
-    return {
-        "is_air_gapped": 1.0 if configuration.get("is_air_gapped") else 0.0,
-    }
 
 
 def _extract_c2_channel_features(channels: list[dict]) -> dict[str, float]:
