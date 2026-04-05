@@ -10,18 +10,17 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extensions
-import psycopg2.extras
 import redis as redis_module
 from confluent_kafka import Consumer, KafkaError
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from extraction.extractor import extract_features
+from ingestion.parser import prepare_batch_rows
+from ingestion.writers import write_to_postgresql, write_to_redis
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,143 +28,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
-
-
-def parse_received_at(timestamp_string: str) -> datetime:
-    """Parse the DD-MM-YYYY HH:MM:SS[.ff] format used in telemetry metadata."""
-    for format_string in ("%d-%m-%Y %H:%M:%S.%f", "%d-%m-%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(timestamp_string, format_string).replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
-            continue
-    raise ValueError(f"Unrecognised timestamp format: {timestamp_string!r}")
-
-
-def prepare_batch_rows(batch: list[dict]) -> tuple[list, list, list[tuple[str, str]]]:
-    """
-    Parse a batch of raw Kafka messages into rows for PostgreSQL and Redis.
-    Returns (implant_rows, telemetry_rows, window_commands).
-    """
-    implant_map: dict[str, tuple] = {}
-    telemetry_rows = []
-    window_commands: list[tuple[str, str]] = []
-
-    for message in batch:
-        implant_row, telemetry_row, commands = parse_message(message)
-        implant_id = implant_row[0]
-        existing = implant_map.get(implant_id)
-        if existing is None:
-            implant_map[implant_id] = implant_row
-        else:
-            implant_map[implant_id] = (
-                implant_id,
-                implant_row[1],
-                min(existing[2], implant_row[2]),
-                max(existing[3], implant_row[3]),
-            )
-        telemetry_rows.append(telemetry_row)
-        window_commands.extend(commands)
-
-    implant_rows = list(implant_map.values())
-    logger.debug(
-        "Prepared batch: %d unique implants, %d telemetry rows, %d window commands",
-        len(implant_rows), len(telemetry_rows), len(window_commands),
-    )
-    return implant_rows, telemetry_rows, window_commands
-
-
-def build_window_commands(
-    implant_id: str, group_id: str, config_type: str, features_json: str,
-) -> list[tuple[str, str]]:
-    """Build Redis window push commands for both implant and group scopes."""
-    return [
-        (f"window:implant:{implant_id}:{config_type}", features_json),
-        (f"window:group:{group_id}:{config_type}", features_json),
-    ]
-
-
-def parse_message(message: dict) -> tuple[tuple, tuple, list[tuple[str, str]]]:
-    """Extract implant row, telemetry row, and window commands from one message."""
-    metadata = message["metadata"]
-    implant_id = str(metadata["implant_id"])
-    group_id = str(metadata["group_id"])
-    config_type = metadata["type"]
-    received_at = parse_received_at(metadata["received_at"])
-    ground_truth = message.get("ground_truth", {})
-
-    features_json = json.dumps(extract_features(message["configuration"], config_type))
-    is_anomaly = bool(ground_truth.get("is_anomaly", False))
-
-    implant_row = (implant_id, group_id, received_at, received_at)
-    telemetry_row = (
-        implant_id, config_type, received_at,
-        json.dumps(message), features_json, is_anomaly,
-        ground_truth.get("injector_tag"),
-    )
-    return implant_row, telemetry_row, build_window_commands(implant_id, group_id, config_type, features_json)
-
-
-def write_to_postgresql(
-    db_connection: psycopg2.extensions.connection,
-    implant_rows: list,
-    telemetry_rows: list,
-) -> None:
-    """Bulk-insert implant and telemetry rows."""
-    logger.debug(
-        "Writing to PostgreSQL: %d implant upserts, %d telemetry inserts",
-        len(implant_rows), len(telemetry_rows),
-    )
-    with db_connection:
-        with db_connection.cursor() as cursor:
-            psycopg2.extras.execute_values(
-                cursor,
-                """
-                INSERT INTO implants (implant_id, group_id, first_seen, last_seen, status)
-                VALUES %s
-                ON CONFLICT (implant_id)
-                DO UPDATE SET
-                    first_seen = LEAST(implants.first_seen, EXCLUDED.first_seen),
-                    last_seen = GREATEST(implants.last_seen, EXCLUDED.last_seen)
-                """,
-                implant_rows,
-                template="(%s, %s, %s, %s, 'active')",
-            )
-            psycopg2.extras.execute_values(
-                cursor,
-                """
-                INSERT INTO telemetry
-                    (implant_id, config_type, received_at, raw, features, is_anomaly, injector_tag)
-                VALUES %s
-                """,
-                telemetry_rows,
-            )
-    logger.debug("PostgreSQL write complete")
-
-
-def write_to_redis(
-    redis_connection: redis_module.Redis,
-    window_commands: list[tuple[str, str]],
-) -> None:
-    """Push feature vectors to sliding windows and increment write counters."""
-    pipeline = redis_connection.pipeline(transaction=False)
-    writes_counter: dict[str, int] = {}
-
-    for key, features_json in window_commands:
-        pipeline.rpush(key, features_json)
-        pipeline.ltrim(key, -config.BASELINE_WINDOW_SIZE, -1)
-        writes_counter[key] = writes_counter.get(key, 0) + 1
-
-    for window_key, count in writes_counter.items():
-        writes_key = "writes:" + window_key.split(":", 1)[1]
-        pipeline.incrby(writes_key, count)
-
-    pipeline.execute()
-    logger.debug(
-        "Redis pipeline: %d window pushes across %d keys",
-        len(window_commands), len(writes_counter),
-    )
 
 
 def flush_batch(
