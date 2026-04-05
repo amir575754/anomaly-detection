@@ -31,7 +31,6 @@ logger.setLevel(logging.DEBUG)
 # Human-friendly names for config types shown in the UI
 _CONFIG_TYPE_DISPLAY_NAMES: dict[str, str] = {
     "dangerous_program_configuration": "Dangerous Programs",
-    "internet_configuration": "Internet",
     "communication_configuration": "Communications",
     "persistence_configuration": "Persistence",
     "capability_configuration": "Capabilities",

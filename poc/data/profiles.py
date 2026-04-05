@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 
 _TYPE_WEIGHTS = {
     "dangerous_program_configuration": 0.15,
-    "internet_configuration": 0.10,
     "communication_configuration": 0.25,
     "persistence_configuration": 0.20,
     "capability_configuration": 0.15,
@@ -60,10 +59,6 @@ def _generate_dangerous_program_configuration() -> dict:
             for driver in drivers
         ],
     }
-
-
-def _generate_internet_configuration() -> dict:
-    return {"is_air_gapped": random.random() < 0.05}
 
 
 def _default_port_for_protocol(protocol: str) -> int:
@@ -125,7 +120,6 @@ def _generate_evasion_configuration() -> dict:
 
 _GENERATORS = {
     "dangerous_program_configuration": _generate_dangerous_program_configuration,
-    "internet_configuration": _generate_internet_configuration,
     "communication_configuration": _generate_communication_configuration,
     "persistence_configuration": _generate_persistence_configuration,
     "capability_configuration": _generate_capability_configuration,

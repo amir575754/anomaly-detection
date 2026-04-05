@@ -120,7 +120,7 @@ Each tick:
 
 - **Isolation Forest scoring**: multivariate anomaly score normalised to [0, 1]. Catches patterns that are subtle across many features but not extreme on any single one.
 
-Config types with too few features (e.g. `internet_configuration` with a single boolean) are excluded.
+Config types listed in `DETECTION_EXCLUDED_CONFIG_TYPES` are skipped.
 
 ### Severity Scoring
 
