@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sys
+import time
 from datetime import datetime
 
 import psycopg2
@@ -21,10 +22,11 @@ from alerts.engine import apply_label, clear_all_suppressions
 from alerts.models import Label
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [dashboard] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 # Human-friendly names for config types shown in the UI
 _CONFIG_TYPE_DISPLAY_NAMES: dict[str, str] = {
@@ -57,11 +59,12 @@ _LABEL_BUTTON_STYLES: dict[str, dict[str, str]] = {
 
 def get_database_connection() -> psycopg2.extensions.connection:
     """Return a cached database connection, reconnecting if it was closed."""
-    existing = st.session_state.get("database_connection")
-    if existing is None or existing.closed:
+    connection = st.session_state.get("database_connection")
+    if connection is None or connection.closed:
         logger.info("Establishing new PostgreSQL connection to %s", config.DB_DSN.split("@")[-1])
-        st.session_state["database_connection"] = psycopg2.connect(config.DB_DSN)
-    return st.session_state["database_connection"]
+        connection = psycopg2.connect(config.DB_DSN)
+        st.session_state["database_connection"] = connection
+    return connection
 
 
 def fetch_alerts(
@@ -163,18 +166,34 @@ def fetch_raw_telemetry(
     window_start: datetime,
     window_end: datetime,
 ) -> dict | None:
+    """Fetch the most recent raw telemetry for an alert's implant and config type.
+    Tries ingested_at first (matches detector's scoring window), then falls back
+    to the most recent row for that implant+config_type combination."""
     with database_connection.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
         cursor.execute(
             """
             SELECT raw FROM telemetry
             WHERE implant_id = %s
               AND config_type = %s
-              AND received_at >= %s
-              AND received_at <  %s
-            ORDER BY received_at DESC
+              AND ingested_at >= %s
+              AND ingested_at <  %s
+            ORDER BY ingested_at DESC
             LIMIT 1
             """,
             (implant_id, config_type, window_start, window_end),
+        )
+        row = cursor.fetchone()
+        if row is not None:
+            return dict(row)["raw"]
+
+        cursor.execute(
+            """
+            SELECT raw FROM telemetry
+            WHERE implant_id = %s AND config_type = %s
+            ORDER BY ingested_at DESC
+            LIMIT 1
+            """,
+            (implant_id, config_type),
         )
         row = cursor.fetchone()
         return dict(row)["raw"] if row else None
@@ -194,102 +213,95 @@ def render_severity_badge(severity: str) -> str:
     )
 
 
+def _card_background_html(severity: str) -> str:
+    background_color = _SEVERITY_BACKGROUND_COLORS.get(severity, "transparent")
+    border_color = _SEVERITY_COLORS.get(severity, "#666")
+    return (
+        f'<div style="background:{background_color};border-radius:8px;'
+        f'padding:12px 16px;margin-bottom:4px;'
+        f'border-left:4px solid {border_color}">'
+    )
+
+
+def _render_card_header(alert: dict) -> None:
+    header_column, badge_column = st.columns([5, 1])
+    with header_column:
+        st.markdown(
+            f"**{alert['implant_id']}** &nbsp;\u00b7&nbsp; "
+            f"group `{alert['group_id']}` &nbsp;\u00b7&nbsp; "
+            f"`{display_config_type(alert['config_type'])}`"
+        )
+    with badge_column:
+        st.markdown(render_severity_badge(alert["severity"]), unsafe_allow_html=True)
+
+
+def _render_card_details(alert: dict) -> None:
+    st.caption(alert["explanation"])
+    details = alert.get("details")
+    if isinstance(details, dict):
+        st.caption(
+            f"Window: {alert['window_start']} \u2192 {alert['window_end']} "
+            f"| Baseline: {alert['baseline_used']} "
+            f"| IF score: {details.get('isolation_forest_score', 0):.3f}"
+        )
+    else:
+        st.caption(f"Window: {alert['window_start']} \u2192 {alert['window_end']}")
+
+
+_LABEL_BUTTONS = [
+    (":dart: True Positive", "true_positive", Label.TRUE_POSITIVE),
+    (":x: False Positive", "false_positive", Label.FALSE_POSITIVE),
+    (":white_check_mark: Expected", "expected", Label.EXPECTED_DEVIATION),
+]
+
+
+def _render_label_button(
+    text: str, key_prefix: str, label: Label,
+    alert_id: str, database_connection: psycopg2.extensions.connection,
+) -> None:
+    if st.button(text, key=f"{key_prefix}_{alert_id}", use_container_width=True):
+        try:
+            apply_label(database_connection, alert_id, label)
+            st.rerun()
+        except Exception as exception:
+            st.error(f"Failed to save label: {exception}")
+
+
+def _render_label_buttons(alert_id: str, database_connection: psycopg2.extensions.connection) -> None:
+    columns = st.columns([1, 1, 1, 2])
+    for column, (text, key_prefix, label) in zip(columns, _LABEL_BUTTONS):
+        with column:
+            _render_label_button(text, key_prefix, label, alert_id, database_connection)
+
+
+def _render_raw_telemetry_expander(alert: dict, database_connection: psycopg2.extensions.connection) -> None:
+    with st.expander("View raw telemetry"):
+        raw = fetch_raw_telemetry(
+            database_connection, alert["implant_id"], alert["config_type"],
+            alert["window_start"], alert["window_end"],
+        )
+        if raw is not None:
+            st.json(raw if isinstance(raw, (dict, list)) else json.loads(raw))
+        else:
+            st.caption("No matching telemetry row found.")
+
+
 def render_alert_card(
     alert: dict,
     database_connection: psycopg2.extensions.connection,
 ) -> None:
-    alert_id = str(alert["alert_id"])
-    severity = alert["severity"]
-    labeled = alert.get("label")
-    background_color = _SEVERITY_BACKGROUND_COLORS.get(severity, "transparent")
-
     with st.container():
-        st.markdown(
-            f'<div style="background:{background_color};border-radius:8px;'
-            f'padding:12px 16px;margin-bottom:4px;'
-            f'border-left:4px solid {_SEVERITY_COLORS.get(severity, "#666")}">',
-            unsafe_allow_html=True,
-        )
+        st.markdown(_card_background_html(alert["severity"]), unsafe_allow_html=True)
+        _render_card_header(alert)
+        _render_card_details(alert)
 
-        header_column, badge_column = st.columns([5, 1])
-        with header_column:
-            st.markdown(
-                f"**{alert['implant_id']}** &nbsp;\u00b7&nbsp; "
-                f"group `{alert['group_id']}` &nbsp;\u00b7&nbsp; "
-                f"`{display_config_type(alert['config_type'])}`"
-            )
-        with badge_column:
-            st.markdown(render_severity_badge(severity), unsafe_allow_html=True)
-
-        st.caption(alert["explanation"])
-
-        details = alert.get("details")
-        if isinstance(details, dict):
-            isolation_forest_score = details.get("isolation_forest_score", 0)
-            st.caption(
-                f"Window: {alert['window_start']} \u2192 {alert['window_end']} "
-                f"| Baseline: {alert['baseline_used']} "
-                f"| IF score: {isolation_forest_score:.3f}"
-            )
+        if alert.get("label"):
+            st.success(f"Labeled: **{alert['label'].replace('_', ' ').title()}**")
         else:
-            st.caption(
-                f"Window: {alert['window_start']} \u2192 {alert['window_end']}"
-            )
+            _render_label_buttons(str(alert["alert_id"]), database_connection)
 
-        if labeled:
-            label_display = labeled.replace("_", " ").title()
-            st.success(f"Labeled: **{label_display}**")
-        else:
-            button_columns = st.columns([1, 1, 1, 2])
-            with button_columns[0]:
-                if st.button(
-                    ":dart: True Positive",
-                    key=f"true_positive_{alert_id}",
-                    use_container_width=True,
-                ):
-                    try:
-                        apply_label(database_connection, alert_id, Label.TRUE_POSITIVE)
-                        st.rerun()
-                    except Exception as exception:
-                        st.error(f"Failed to save label: {exception}")
-            with button_columns[1]:
-                if st.button(
-                    ":x: False Positive",
-                    key=f"false_positive_{alert_id}",
-                    use_container_width=True,
-                ):
-                    try:
-                        apply_label(database_connection, alert_id, Label.FALSE_POSITIVE)
-                        st.rerun()
-                    except Exception as exception:
-                        st.error(f"Failed to save label: {exception}")
-            with button_columns[2]:
-                if st.button(
-                    ":white_check_mark: Expected",
-                    key=f"expected_{alert_id}",
-                    use_container_width=True,
-                ):
-                    try:
-                        apply_label(database_connection, alert_id, Label.EXPECTED_DEVIATION)
-                        st.rerun()
-                    except Exception as exception:
-                        st.error(f"Failed to save label: {exception}")
-
-        with st.expander("View raw telemetry"):
-            raw_telemetry = fetch_raw_telemetry(
-                database_connection,
-                alert["implant_id"],
-                alert["config_type"],
-                alert["window_start"],
-                alert["window_end"],
-            )
-            if raw_telemetry:
-                st.json(raw_telemetry)
-            else:
-                st.caption("No matching telemetry row found for this window.")
-
+        _render_raw_telemetry_expander(alert, database_connection)
         st.markdown("</div>", unsafe_allow_html=True)
-
     st.divider()
 
 
@@ -322,11 +334,14 @@ def render_metrics_panel(
     database_connection: psycopg2.extensions.connection,
 ) -> None:
     st.subheader("Detection Summary")
-
     render_severity_breakdown(metrics)
-
     st.markdown("---")
+    _render_detection_rates(metrics, detection)
+    st.markdown("---")
+    _render_label_breakdown(metrics, suppressed_patterns, database_connection)
 
+
+def _render_detection_rates(metrics: dict, detection: dict) -> None:
     labeled_count = metrics["true_positive_count"] + metrics["false_positive_count"]
     false_positive_rate = (
         metrics["false_positive_count"] / labeled_count if labeled_count > 0 else 0.0
@@ -335,23 +350,26 @@ def render_metrics_panel(
     detection_rate = (
         detection["detected"] / total_injected if total_injected > 0 else 0.0
     )
-
-    rate_left_column, rate_right_column = st.columns(2)
-    with rate_left_column:
+    left_column, right_column = st.columns(2)
+    with left_column:
         st.metric("Detection Rate", f"{detection_rate:.1%}")
         st.caption(f"{detection['detected']} / {total_injected} anomalies caught")
-    with rate_right_column:
+    with right_column:
         st.metric("False Positive Rate", f"{false_positive_rate:.1%}")
         st.caption(f"{metrics['false_positive_count']} / {labeled_count} labeled")
 
-    st.markdown("---")
 
+def _render_label_breakdown(
+    metrics: dict,
+    suppressed_patterns: list,
+    database_connection: psycopg2.extensions.connection,
+) -> None:
     st.markdown("**Label Breakdown**")
-    label_left_column, label_right_column = st.columns(2)
-    with label_left_column:
+    left_column, right_column = st.columns(2)
+    with left_column:
         st.metric("True Positives", metrics["true_positive_count"])
         st.metric("False Positives", metrics["false_positive_count"])
-    with label_right_column:
+    with right_column:
         st.metric("Expected Deviations", metrics["expected_deviation_count"])
         st.metric("Unlabeled", metrics["unlabeled_count"])
 
@@ -423,9 +441,8 @@ def render_alert_feed(
     if not alerts:
         message = (
             "No alerts match the current filters." if filter_label
-            else "No alerts yet. The detector processes telemetry in "
-            f"{config.DETECTION_WINDOW_MINUTES}-minute windows. "
-            "Alerts will appear here as anomalies are detected."
+            else "No alerts yet. Alerts will appear here as the "
+            "detector processes incoming telemetry."
         )
         st.info(message)
         return
@@ -467,7 +484,6 @@ def main() -> None:
         filter_label = build_filter_label(severity_filter, group_filter)
         render_alert_feed(alerts, database_connection, filter_label)
 
-    import time
     time.sleep(config.DASHBOARD_REFRESH_INTERVAL_SECONDS)
     st.rerun()
 

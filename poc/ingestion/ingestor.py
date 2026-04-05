@@ -24,10 +24,11 @@ import config
 from extraction.extractor import extract_features
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [ingestor] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 def parse_received_at(timestamp_string: str) -> datetime:
@@ -75,6 +76,16 @@ def prepare_batch_rows(batch: list[dict]) -> tuple[list, list, list[tuple[str, s
     return implant_rows, telemetry_rows, window_commands
 
 
+def build_window_commands(
+    implant_id: str, group_id: str, config_type: str, features_json: str,
+) -> list[tuple[str, str]]:
+    """Build Redis window push commands for both implant and group scopes."""
+    return [
+        (f"window:implant:{implant_id}:{config_type}", features_json),
+        (f"window:group:{group_id}:{config_type}", features_json),
+    ]
+
+
 def parse_message(message: dict) -> tuple[tuple, tuple, list[tuple[str, str]]]:
     """Extract implant row, telemetry row, and window commands from one message."""
     metadata = message["metadata"]
@@ -84,28 +95,16 @@ def parse_message(message: dict) -> tuple[tuple, tuple, list[tuple[str, str]]]:
     received_at = parse_received_at(metadata["received_at"])
     ground_truth = message.get("ground_truth", {})
 
-    features = extract_features(message["configuration"], config_type)
-    features_json = json.dumps(features)
-
+    features_json = json.dumps(extract_features(message["configuration"], config_type))
     is_anomaly = bool(ground_truth.get("is_anomaly", False))
-    if is_anomaly:
-        logger.debug(
-            "Anomalous event: implant=%s config_type=%s injector=%s",
-            implant_id, config_type, ground_truth.get("injector_tag"),
-        )
 
     implant_row = (implant_id, group_id, received_at, received_at)
     telemetry_row = (
         implant_id, config_type, received_at,
-        json.dumps(message), features_json,
-        is_anomaly,
+        json.dumps(message), features_json, is_anomaly,
         ground_truth.get("injector_tag"),
     )
-    window_commands = [
-        (f"window:implant:{implant_id}:{config_type}", features_json),
-        (f"window:group:{group_id}:{config_type}", features_json),
-    ]
-    return implant_row, telemetry_row, window_commands
+    return implant_row, telemetry_row, build_window_commands(implant_id, group_id, config_type, features_json)
 
 
 def write_to_postgresql(
@@ -272,38 +271,32 @@ def consume_loop(
             last_logged_at_count = processed
 
 
-def run() -> None:
-    logger.info("Connecting to PostgreSQL at %s", config.DB_DSN.split("@")[-1])
+def connect_infrastructure() -> tuple[psycopg2.extensions.connection, redis_module.Redis, Consumer]:
+    """Establish connections to PostgreSQL, Redis, and Kafka."""
+    logger.info("Connecting to PostgreSQL, Redis, and Kafka")
     db_connection = psycopg2.connect(config.DB_DSN)
-    logger.info("PostgreSQL connection established")
-
-    logger.info("Connecting to Redis at %s:%d", config.REDIS_HOST, config.REDIS_PORT)
     redis_connection = redis_module.Redis(
-        host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False
+        host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
-    logger.info("Redis connection established")
-
     consumer = make_consumer()
+    logger.info("All connections established")
+    return db_connection, redis_connection, consumer
 
-    logger.info(
-        "Ingestor ready — batch size %d, poll timeout %.1fs, log every %d messages",
-        config.INGESTOR_BATCH_SIZE,
-        config.KAFKA_POLL_TIMEOUT_SECONDS,
-        config.INGESTOR_LOG_INTERVAL_MESSAGES,
-    )
+
+def run() -> None:
+    db_connection, redis_connection, consumer = connect_infrastructure()
+    logger.info("Ingestor ready — batch size %d", config.INGESTOR_BATCH_SIZE)
 
     try:
         consume_loop(db_connection, redis_connection, consumer)
     except KeyboardInterrupt:
-        logger.info("Received keyboard interrupt — shutting down")
+        logger.info("Shutting down")
     except Exception:
-        logger.critical("Unrecoverable error in consume loop", exc_info=True)
+        logger.critical("Unrecoverable error", exc_info=True)
         raise
     finally:
-        logger.info("Closing Kafka consumer and database connection")
         consumer.close()
         db_connection.close()
-        logger.info("Shutdown complete")
 
 
 if __name__ == "__main__":

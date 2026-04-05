@@ -30,8 +30,10 @@ logger = logging.getLogger(__name__)
 def compute_single_feature_fence(
     feature_vectors: list[dict[str, float]],
     feature_name: str,
+    iqr_multiplier: float | None = None,
 ) -> dict:
     """Compute Q1, Q3, IQR, median, and fences for one feature."""
+    multiplier = iqr_multiplier if iqr_multiplier is not None else config.IQR_MULTIPLIER
     values = np.array([vector.get(feature_name, 0.0) for vector in feature_vectors])
     q1, median_value, q3 = np.percentile(values, [25, 50, 75])
     iqr = float(q3 - q1)
@@ -40,44 +42,81 @@ def compute_single_feature_fence(
         "Q3": float(q3),
         "IQR": iqr,
         "median": float(median_value),
-        "lower_fence": float(q1) - config.IQR_MULTIPLIER * iqr,
-        "upper_fence": float(q3) + config.IQR_MULTIPLIER * iqr,
+        "lower_fence": float(q1) - multiplier * iqr,
+        "upper_fence": float(q3) + multiplier * iqr,
     }
 
 
-def compute_iqr_fences(feature_vectors: list[dict[str, float]]) -> dict[str, dict]:
-    """Compute per-feature IQR fences from a list of feature vectors."""
+def compute_iqr_fences(
+    feature_vectors: list[dict[str, float]],
+    config_type: str | None = None,
+) -> dict[str, dict]:
+    """Compute per-feature IQR fences, using per-config-type multiplier overrides."""
     if len(feature_vectors) < config.MINIMUM_TRAINING_SAMPLES:
         raise ValueError(
             f"Need at least {config.MINIMUM_TRAINING_SAMPLES} samples; "
             f"got {len(feature_vectors)}"
         )
+    iqr_multiplier = config.CONFIG_TYPE_IQR_OVERRIDES.get(config_type) if config_type else None
     feature_names = list(feature_vectors[0].keys())
-    logger.debug("Computing IQR fences for %d features across %d samples",
-                 len(feature_names), len(feature_vectors))
+    logger.debug(
+        "Computing IQR fences for %d features across %d samples (multiplier=%s)",
+        len(feature_names), len(feature_vectors),
+        iqr_multiplier or config.IQR_MULTIPLIER,
+    )
     return {
-        feature_name: compute_single_feature_fence(feature_vectors, feature_name)
+        feature_name: compute_single_feature_fence(
+            feature_vectors, feature_name, iqr_multiplier
+        )
         for feature_name in feature_names
     }
+
+
+def filter_low_variance_features(
+    feature_vectors: list[dict[str, float]],
+    feature_names: list[str],
+) -> list[str]:
+    """Return only features whose variance exceeds FEATURE_VARIANCE_THRESHOLD."""
+    active = []
+    for name in feature_names:
+        values = [vector.get(name, 0.0) for vector in feature_vectors]
+        variance = np.var(values)
+        if variance >= config.FEATURE_VARIANCE_THRESHOLD:
+            active.append(name)
+        else:
+            logger.debug("Dropping low-variance feature %r (variance=%.6f)", name, variance)
+    logger.debug(
+        "Feature filter: %d/%d features retained (threshold=%.4f)",
+        len(active), len(feature_names), config.FEATURE_VARIANCE_THRESHOLD,
+    )
+    return active
 
 
 def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> IsolationForest:
     """
     Fit and return an IsolationForest on the full feature matrix.
 
-    Attaches a `feature_column_order` attribute to the trained model so the
-    scorer can reconstruct the vector in the same column order at scoring time.
+    Stores on the model:
+    - feature_column_order: all feature names (alphabetical)
+    - active_features: features that passed variance filtering (used for scoring)
+    - train_score_mean / train_score_std: calibration stats for z-score normalization
     """
     if not feature_vectors:
         raise ValueError("Cannot train IsolationForest on zero samples")
 
-    feature_names = sorted(feature_vectors[0].keys())
+    all_feature_names = sorted(feature_vectors[0].keys())
+    active_features = filter_low_variance_features(feature_vectors, all_feature_names)
+
+    if not active_features:
+        logger.warning("All features dropped by variance filter — using all features")
+        active_features = all_feature_names
+
     matrix = np.array(
-        [[vector.get(name, 0.0) for name in feature_names] for vector in feature_vectors]
+        [[vector.get(name, 0.0) for name in active_features] for vector in feature_vectors]
     )
     logger.debug(
         "Training IsolationForest: %d samples x %d features, "
-        "n_estimators=%d, contamination=%.3f",
+        "n_estimators=%d, contamination=%s",
         matrix.shape[0], matrix.shape[1],
         config.ISOLATION_FOREST_ESTIMATORS,
         config.ISOLATION_FOREST_CONTAMINATION,
@@ -88,8 +127,18 @@ def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> Isolation
         random_state=config.ISOLATION_FOREST_RANDOM_STATE,
     )
     model.fit(matrix)
-    model.feature_column_order = feature_names  # type: ignore[attr-defined]
-    logger.debug("IsolationForest training complete")
+
+    train_scores = model.decision_function(matrix)
+    model.feature_column_order = all_feature_names  # type: ignore[attr-defined]
+    model.active_features = active_features  # type: ignore[attr-defined]
+    model.train_score_mean = float(np.mean(train_scores))  # type: ignore[attr-defined]
+    model.train_score_std = float(np.std(train_scores))  # type: ignore[attr-defined]
+
+    logger.debug(
+        "IsolationForest trained: active_features=%d, "
+        "train_score_mean=%.4f, train_score_std=%.4f",
+        len(active_features), model.train_score_mean, model.train_score_std,  # type: ignore[attr-defined]
+    )
     return model
 
 
@@ -162,6 +211,25 @@ def persist_baseline_to_postgresql(
     logger.debug("Persisted baseline stats to PostgreSQL: %s:%s:%s", scope, scope_id, config_type)
 
 
+def slice_window_for_scope(
+    feature_vectors: list[dict[str, float]],
+    scope: str,
+) -> list[dict[str, float]]:
+    """Trim the feature vector list to the appropriate scope-specific window size."""
+    if scope == "implant":
+        max_size = config.BASELINE_WINDOW_SIZE_IMPLANT
+    else:
+        max_size = config.BASELINE_WINDOW_SIZE_GROUP
+
+    if len(feature_vectors) > max_size:
+        logger.debug(
+            "Slicing %s window from %d to %d vectors",
+            scope, len(feature_vectors), max_size,
+        )
+        return feature_vectors[-max_size:]
+    return feature_vectors
+
+
 def refresh_baseline(
     redis_connection: redis_module.Redis,
     db_connection: psycopg2.extensions.connection,
@@ -176,7 +244,8 @@ def refresh_baseline(
     if feature_vectors is None:
         return
 
-    fences = compute_iqr_fences(feature_vectors)
+    feature_vectors = slice_window_for_scope(feature_vectors, scope)
+    fences = compute_iqr_fences(feature_vectors, config_type)
     model = train_isolation_forest(feature_vectors)
 
     save_model_to_redis(

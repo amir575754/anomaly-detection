@@ -31,7 +31,7 @@ _APPLICATION_TABLES = (
     "suppressed_patterns", "alerts", "baselines", "telemetry", "implants",
 )
 
-_REDIS_KEY_PATTERNS = ("window:*", "model:*", "writes:*")
+_REDIS_KEY_PATTERNS = ("window:*", "model:*", "writes:*", "detector:*")
 
 
 def log_table_row_counts(database_connection) -> None:

@@ -1,9 +1,8 @@
 """
 Orchestrates the two-phase demo run:
-  1. Baseline phase — publishes 10 days of clean synthetic snapshots, then
-     waits for the ingestor to finish and bootstraps the initial baselines.
-  2. Live phase — streams new snapshots with rate limiting, injecting anomalies
-     at ANOMALY_RATE.
+  1. Baseline phase — publishes clean synthetic snapshots, waits for the
+     ingestor to finish, and bootstraps the initial baselines.
+  2. Live phase — streams new snapshots with anomaly injection at ANOMALY_RATE.
 """
 
 import json
@@ -27,10 +26,11 @@ from data.profiles import generate_snapshot, sample_config_type
 from detection.baseline import refresh_baseline
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [generator] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 _MINUTES_PER_SNAPSHOT: int = (24 * 60) // config.SNAPSHOTS_PER_IMPLANT_PER_DAY
 
@@ -177,6 +177,21 @@ def parse_window_key(raw_key: bytes) -> tuple[str, str, str] | None:
     return None
 
 
+def save_baseline_cursor() -> None:
+    """Store the current max telemetry ID so the detector knows where live data starts."""
+    db_connection = psycopg2.connect(config.DB_DSN)
+    redis_connection = redis_module.Redis(
+        host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
+    )
+    with db_connection.cursor() as cursor:
+        cursor.execute("SELECT COALESCE(MAX(id), 0) FROM telemetry")
+        row = cursor.fetchone()
+        max_id = row[0] if row else 0
+    redis_connection.set("detector:baseline_cursor", str(max_id))
+    logger.info("Saved baseline cursor to Redis: telemetry id %d", max_id)
+    db_connection.close()
+
+
 def bootstrap_baselines() -> None:
     """Refresh baselines for all window keys populated during ingestion."""
     logger.info("Connecting to PostgreSQL and Redis for baseline bootstrap")
@@ -244,16 +259,46 @@ def generate_live_event(
     return snapshot, False
 
 
+def has_reached_event_cap(total_published: int) -> bool:
+    """Return True if the live phase should stop due to the event cap."""
+    return config.LIVE_PHASE_MAX_EVENTS > 0 and total_published >= config.LIVE_PHASE_MAX_EVENTS
+
+
+def publish_live_round(
+    producer: Producer,
+    implants: list[tuple[str, str]],
+    total_published: int,
+    total_anomalies: int,
+    window_start: float,
+    window_count: int,
+) -> tuple[int, int, float, int, bool]:
+    """Publish one event per implant. Returns updated counters and whether cap was reached."""
+    for implant_id, group_id in implants:
+        snapshot, is_anomaly = generate_live_event(implant_id, group_id)
+        if is_anomaly:
+            total_anomalies += 1
+
+        publish(producer, snapshot)
+        total_published += 1
+        window_count += 1
+
+        window_start, window_count = enforce_rate_limit(
+            window_start, window_count, config.LIVE_PHASE_MAX_EVENTS_PER_SECOND,
+        )
+
+        if has_reached_event_cap(total_published):
+            return total_published, total_anomalies, window_start, window_count, True
+
+    return total_published, total_anomalies, window_start, window_count, False
+
+
 def run_live_phase(producer: Producer, implants: list[tuple[str, str]]) -> None:
     """Stream rate-limited snapshots with anomaly injection until cap or interrupt."""
-    max_events_per_second = config.LIVE_PHASE_MAX_EVENTS_PER_SECOND
-    max_events = config.LIVE_PHASE_MAX_EVENTS
-
     logger.info(
         "Live phase started — anomaly rate: %.1f%%, rate limit: %s/sec, max: %s",
         config.ANOMALY_RATE * 100,
-        max_events_per_second or "unlimited",
-        max_events or "unlimited",
+        config.LIVE_PHASE_MAX_EVENTS_PER_SECOND or "unlimited",
+        config.LIVE_PHASE_MAX_EVENTS or "unlimited",
     )
     total_published = 0
     total_anomalies = 0
@@ -262,28 +307,19 @@ def run_live_phase(producer: Producer, implants: list[tuple[str, str]]) -> None:
 
     try:
         while True:
-            for implant_id, group_id in implants:
-                snapshot, is_anomaly = generate_live_event(implant_id, group_id)
-                if is_anomaly:
-                    total_anomalies += 1
-
-                publish(producer, snapshot)
-                total_published += 1
-                window_count += 1
-
-                window_start, window_count = enforce_rate_limit(
-                    window_start, window_count, max_events_per_second,
+            total_published, total_anomalies, window_start, window_count, capped = (
+                publish_live_round(
+                    producer, implants, total_published, total_anomalies,
+                    window_start, window_count,
                 )
-
-                if max_events > 0 and total_published >= max_events:
-                    producer.flush()
-                    log_live_summary(total_published, total_anomalies, "reached event cap")
-                    return
-
+            )
+            if capped:
+                producer.flush()
+                log_live_summary(total_published, total_anomalies, "reached event cap")
+                return
             if total_published % 1000 == 0:
                 producer.flush()
                 log_live_summary(total_published, total_anomalies, "progress")
-
     except KeyboardInterrupt:
         producer.flush()
         log_live_summary(total_published, total_anomalies, "stopped")
@@ -310,16 +346,17 @@ def main() -> None:
     producer = make_producer()
     logger.info("Kafka producer connected to %s", config.KAFKA_BOOTSTRAP)
 
-    logger.info("=== Phase 1: Baseline generation ===")
+    logger.info("=== Baseline: generating synthetic history ===")
     total_baseline_events = run_baseline_phase(producer, implants)
 
-    logger.info("=== Phase 1.5: Waiting for ingestor ===")
+    logger.info("=== Baseline: waiting for ingestor ===")
     wait_for_ingestor(total_baseline_events)
 
-    logger.info("=== Phase 1.75: Bootstrap baselines ===")
+    logger.info("=== Baseline: bootstrapping models ===")
     bootstrap_baselines()
+    save_baseline_cursor()
 
-    logger.info("=== Phase 2: Live streaming ===")
+    logger.info("=== Live: streaming with anomaly injection ===")
     run_live_phase(producer, implants)
 
 

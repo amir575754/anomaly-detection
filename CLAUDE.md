@@ -10,7 +10,8 @@ This is a **proof-of-concept** targeting a live demo. The architecture should re
 
 - **Purpose:** Catch operator errors and operational risks across implants in near real-time
 - **Users:** NOC operators who receive alerts, classify them, and use feedback to improve detection
-- **Alert latency target:** 5-minute batch windows
+- **Demo timing:** The complete demo (baseline + live + detection) must finish in under 3 minutes so it can be presented live to stakeholders
+- **Alert latency:** Detector must keep up with incoming telemetry — no multi-minute backlogs
 - **Detection approach:** Fully autonomous (no manual rules/signatures); baseline learning at per-implant and per-group levels
 - **Scope:** Config snapshot telemetry only. Logs and non-config products are out of scope for the PoC.
 
@@ -20,7 +21,7 @@ This is a **proof-of-concept** targeting a live demo. The architecture should re
 
 The demo runs in two phases:
 
-1. **Baseline phase (compressed time):** A dataset generator pre-populates the system with synthetic historical data representing 10 days of normal implant behaviour across all groups. This data is ingested in bulk at maximum speed before the live phase starts. Per-implant baselines become active after 7 days of data per implant; group baselines are used until then.
+1. **Baseline phase (compressed time):** A dataset generator pre-populates the system with synthetic historical data representing normal implant behaviour across all groups. This data is ingested in bulk at maximum speed before the live phase starts. Per-implant baselines become active after `IMPLANT_BASELINE_MIN_DAYS` of data per implant; group baselines are used until then.
 
 2. **Live phase:** The generator streams a new wave of telemetry — ~4% of events are anomalous (injected using `anomalies.py`) — as fast as the pipeline can process. The Streamlit UI shows alerts appearing in real time as the detector processes each batch.
 
@@ -160,11 +161,11 @@ Implants belong to **implant groups**. Groups are a first-class concept — they
 
 ### Implants and Groups
 
-The generator creates a configurable number of implants spread across groups. Default: **50 implants across 3 groups**. Large enough for stable group baselines; small enough to run fast.
+The generator creates a configurable number of implants spread across groups. Must be large enough for stable group baselines but small enough that the full demo finishes within the timing budget.
 
 ### Baseline Phase
 
-- Generate **10 days** of synthetic snapshots per implant
+- Generate enough days of synthetic snapshots per implant to exceed `IMPLANT_BASELINE_MIN_DAYS`
 - Config type distribution follows weights in `profiles.py` (`_TYPE_WEIGHTS`)
 - All events are clean (no anomalies injected)
 - Publish to Kafka and ingest at maximum speed before starting the live phase
@@ -210,10 +211,10 @@ Feature extraction is implemented in `extractor.py` (provided). The `extract_fea
 
 Every feature vector is scored against two baselines:
 
-- **Per-implant baseline** — built from this implant's own history. Active after **7 days** of per-implant data.
+- **Per-implant baseline** — built from this implant's own history. Active after `IMPLANT_BASELINE_MIN_DAYS` of per-implant data.
 - **Per-group baseline** — built from all implants in the group. Always active.
 
-During the first 7 days for a given implant, only the group baseline is used. Once 7 days of per-implant data exists, both baselines are computed and the per-implant result takes precedence. Alerts always indicate which baseline was used.
+During the cold-start period for a given implant, only the group baseline is used. Once enough per-implant data exists, the per-implant result takes precedence. Alerts always indicate which baseline was used.
 
 ### Detection Models
 
@@ -221,7 +222,7 @@ Two models run in parallel on each feature vector.
 
 **IQR detector (statistical, per-feature):**
 - For each feature, compute Q1, Q3, and IQR from the baseline window
-- Flag the feature if the observed value falls outside `[Q1 - k*IQR, Q3 + k*IQR]` where `k=2.5` (configurable via `IQR_MULTIPLIER` in `config.py`)
+- Flag the feature if the observed value falls outside `[Q1 - k*IQR, Q3 + k*IQR]` where `k` is configurable via `IQR_MULTIPLIER` in `config.py`
 - IQR is robust to outliers and makes no assumptions about the underlying distribution
 - Produces per-feature deviation scores — the primary source of alert explainability
 
@@ -235,19 +236,17 @@ Both detectors must independently signal anomalous for a HIGH alert. Either alon
 
 ### Severity Scoring
 
-| Level | IQR condition | IF condition | Logic |
-|-------|---------------|--------------|-------|
-| **HIGH** | Significant: 2+ features deviated, or 1 feature >5× IQR outside fence | Score > 0.7 | Both detectors agree |
-| **MEDIUM** | Any: 1+ features deviated | Any (or none) | IQR deviation alone is sufficient |
-| **MEDIUM** | None | Score 0.5–0.7 | Medium IF signal alone |
-| **LOW** | None | Score > 0.7 | Strong IF signal with no IQR corroboration |
-| *No alert* | None | Score < 0.5 | Neither detector flagged anything |
+| Level | Criteria |
+|-------|----------|
+| **HIGH** | Both detectors agree: IQR shows significant deviation (multiple features or extreme single-feature breach) AND Isolation Forest score exceeds the high threshold. |
+| **MEDIUM** | Either detector alone: any IQR deviation, or a moderate IF score. |
+| **LOW** | IF signal only, no IQR breach. |
 
-Thresholds are constants in `config.py` (`IQR_SIGNIFICANT_MULTIPLIER`, `IQR_SIGNIFICANT_FEATURE_COUNT`, `ISOLATION_FOREST_HIGH_THRESHOLD`, `ISOLATION_FOREST_MEDIUM_THRESHOLD`).
+All thresholds (`IQR_SIGNIFICANT_FEATURE_COUNT`, `IQR_SIGNIFICANT_MULTIPLIER`, `ISOLATION_FOREST_HIGH_THRESHOLD`, `ISOLATION_FOREST_MEDIUM_THRESHOLD`) are constants in `config.py`. Tune them to keep false positive noise low enough that the demo dashboard is readable.
 
-### Batch Window
+### Detection Loop
 
-Detection runs every **5 minutes** over all messages received in that window.
+The detector runs in a continuous loop. When there is a backlog of unscored telemetry, it processes ticks back-to-back. When caught up, it sleeps briefly (`DETECTION_IDLE_SLEEP_SECONDS`) before polling again. This keeps alert latency low during the demo.
 
 ---
 
@@ -290,9 +289,9 @@ Auto-generate `explanation` from `deviating_features`. Format:
 
 ### Fatigue Mitigation
 
-- **Deduplication:** suppress duplicate alerts for the same (implant, config type, deviating feature set) within a 15-minute window
-- **Rate limiting:** max 3 alerts per implant per 5-minute window
-- **False positive suppression:** if an alert pattern accumulates 3+ `false_positive` labels, suppress it and log the suppression. Threshold configurable via `SUPPRESSION_LABEL_THRESHOLD` in `config.py`
+- **Deduplication:** suppress duplicate alerts for the same (implant, config type, deviating feature set) within `DEDUP_WINDOW_MINUTES`
+- **Rate limiting:** max `RATE_LIMIT_PER_WINDOW` alerts per implant per detection tick
+- **False positive suppression:** if an alert pattern accumulates enough `false_positive` labels (threshold: `SUPPRESSION_LABEL_THRESHOLD`), suppress it and log the suppression
 
 ---
 
@@ -309,7 +308,7 @@ Auto-generate `explanation` from `deviating_features`. Format:
 ### Feedback Behaviour (PoC)
 
 - Labels are stored on the alert record in PostgreSQL
-- `false_positive` labels count toward pattern suppression (3 labels = suppress)
+- `false_positive` labels count toward pattern suppression (threshold: `SUPPRESSION_LABEL_THRESHOLD`)
 - No automatic threshold adjustment in the PoC — suppression is the only mechanical effect
 - Policy questions (scope, decay, per-operator weighting) remain open for post-PoC experimentation
 
@@ -436,10 +435,10 @@ model:group:ALPHA:communication_configuration  →  Hash {
 }
 ```
 
-The detector runs on a 5-minute tick and does two things:
+The detector runs in a continuous loop and does two things per tick:
 
 1. **Retrain** (if the window list has grown by more than `RETRAIN_THRESHOLD` new entries since `trained_at`): read the full window list, recompute IQR fences, refit Isolation Forest, write back to the model hash.
-2. **Score**: read the model hash, score every feature vector from the last 5-minute window in PostgreSQL against the cached fences and model, pass results to the alert engine.
+2. **Score**: read the model hash, score unprocessed feature vectors from PostgreSQL against the cached fences and model, pass results to the alert engine.
 
 ### Detector → Alert Engine
 

@@ -180,6 +180,53 @@ def persist_alert(
     logger.debug("Persisted alert %s to PostgreSQL", alert.alert_id)
 
 
+def should_skip_event(
+    pattern_hash: str,
+    implant_id: str,
+    suppressed_hashes: set[str],
+    recent_hashes: set[str],
+    alert_count_by_implant: Counter,
+) -> str | None:
+    """Return the skip reason, or None if the event should generate an alert."""
+    if pattern_hash in suppressed_hashes:
+        logger.debug("Skipping suppressed pattern %s for implant %s", pattern_hash, implant_id)
+        return "suppressed"
+    if pattern_hash in recent_hashes:
+        logger.debug("Skipping duplicate pattern %s for implant %s", pattern_hash, implant_id)
+        return "duplicate"
+    if alert_count_by_implant[implant_id] >= config.RATE_LIMIT_PER_WINDOW:
+        logger.debug("Rate limit reached for implant %s", implant_id)
+        return "rate_limited"
+    return None
+
+
+def build_alert(
+    event: ScoredEvent,
+    severity: Severity,
+    window_start: datetime,
+    window_end: datetime,
+) -> Alert:
+    """Construct an Alert from a scored event."""
+    row = event.telemetry_row
+    return Alert(
+        alert_id=str(uuid.uuid4()),
+        implant_id=row["implant_id"],
+        group_id=row["group_id"],
+        config_type=row["config_type"],
+        timestamp=datetime.now(timezone.utc),
+        window_start=window_start,
+        window_end=window_end,
+        severity=severity,
+        baseline_used=event.baseline_used,
+        deviating_features=event.deviating_features,
+        isolation_forest_score=event.isolation_forest_score,
+        explanation=generate_explanation(
+            row["implant_id"], row["group_id"], event.deviating_features, severity,
+        ),
+        label=None,
+    )
+
+
 def process_scored_events(
     db_connection: psycopg2.extensions.connection,
     scored_events: list[ScoredEvent],
@@ -190,89 +237,42 @@ def process_scored_events(
     Filter, deduplicate, and persist alerts for a batch of scored events.
     Fatigue mitigation applied in order: suppression -> deduplication -> rate limiting.
     """
-    logger.info(
-        "Processing %d scored events for alert generation (window %s to %s)",
-        len(scored_events), window_start.isoformat(), window_end.isoformat(),
-    )
-    dedup_cutoff = datetime.now(timezone.utc) - timedelta(
-        minutes=config.DEDUP_WINDOW_MINUTES
-    )
+    logger.info("Processing %d scored events for alert generation", len(scored_events))
+    dedup_cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.DEDUP_WINDOW_MINUTES)
     suppressed_hashes = fetch_suppressed_hashes(db_connection)
     recent_hashes = fetch_recent_pattern_hashes(db_connection, dedup_cutoff)
     alert_count_by_implant: Counter[str] = Counter()
-
-    created_count = 0
-    skipped_no_severity = 0
-    skipped_suppressed = 0
-    skipped_duplicate = 0
-    skipped_rate_limited = 0
+    skip_counts: Counter[str] = Counter()
 
     for event in scored_events:
-        row = event.telemetry_row
-        implant_id = row["implant_id"]
-        group_id = row["group_id"]
-        config_type = row["config_type"]
-
         severity = determine_severity(event.deviating_features, event.isolation_forest_score)
         if severity is None:
-            skipped_no_severity += 1
+            skip_counts["no_severity"] += 1
             continue
 
-        pattern_hash = compute_pattern_hash(implant_id, config_type, event.deviating_features)
-
-        if pattern_hash in suppressed_hashes:
-            logger.debug("Skipping suppressed pattern %s for implant %s", pattern_hash, implant_id)
-            skipped_suppressed += 1
-            continue
-
-        if pattern_hash in recent_hashes:
-            logger.debug("Skipping duplicate pattern %s for implant %s", pattern_hash, implant_id)
-            skipped_duplicate += 1
-            continue
-
-        if alert_count_by_implant[implant_id] >= config.RATE_LIMIT_PER_WINDOW:
-            logger.debug("Rate limit reached for implant %s (%d alerts this window)",
-                         implant_id, config.RATE_LIMIT_PER_WINDOW)
-            skipped_rate_limited += 1
-            continue
-
-        explanation = generate_explanation(
-            implant_id, group_id, event.deviating_features, severity
+        row = event.telemetry_row
+        pattern_hash = compute_pattern_hash(row["implant_id"], row["config_type"], event.deviating_features)
+        skip_reason = should_skip_event(
+            pattern_hash, row["implant_id"], suppressed_hashes, recent_hashes, alert_count_by_implant,
         )
+        if skip_reason:
+            skip_counts[skip_reason] += 1
+            continue
 
-        alert = Alert(
-            alert_id=str(uuid.uuid4()),
-            implant_id=implant_id,
-            group_id=group_id,
-            config_type=config_type,
-            timestamp=datetime.now(timezone.utc),
-            window_start=window_start,
-            window_end=window_end,
-            severity=severity,
-            baseline_used=event.baseline_used,
-            deviating_features=event.deviating_features,
-            isolation_forest_score=event.isolation_forest_score,
-            explanation=explanation,
-            label=None,
-        )
-
+        alert = build_alert(event, severity, window_start, window_end)
         persist_alert(db_connection, alert, pattern_hash)
         recent_hashes.add(pattern_hash)
-        alert_count_by_implant[implant_id] += 1
-        created_count += 1
+        alert_count_by_implant[row["implant_id"]] += 1
         logger.info(
-            "ALERT CREATED: %s [%s] implant=%s group=%s config=%s baseline=%s "
-            "deviations=%d IF_score=%.3f",
-            alert.alert_id, severity.value, implant_id, group_id, config_type,
-            event.baseline_used, len(event.deviating_features),
-            event.isolation_forest_score,
+            "ALERT CREATED: %s [%s] implant=%s config=%s IF=%.3f",
+            alert.alert_id, severity.value, alert.implant_id,
+            alert.config_type, event.isolation_forest_score,
         )
 
     logger.info(
-        "Alert generation complete: %d created, %d no severity, "
-        "%d suppressed, %d duplicate, %d rate-limited",
-        created_count, skipped_no_severity,
-        skipped_suppressed, skipped_duplicate, skipped_rate_limited,
+        "Alert generation complete: %d created, %s",
+        alert_count_by_implant.total(),
+        ", ".join(f"{count} {reason}" for reason, count in skip_counts.items()),
     )
 
 

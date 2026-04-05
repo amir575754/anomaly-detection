@@ -29,10 +29,11 @@ from alerts.models import FeatureDeviation, ScoredEvent
 from detection.baseline import load_model_from_redis, refresh_baseline, should_retrain
 
 logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)s [detector] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 def discover_window_keys(redis_connection: redis_module.Redis) -> list[tuple[str, str, str]]:
@@ -88,57 +89,65 @@ def resolve_baseline_scope(
     return "group", group_id
 
 
+def resolve_scopes_for_batch(
+    redis_connection: redis_module.Redis,
+    telemetry_rows: list[dict],
+    implant_registry: dict[str, dict],
+) -> tuple[dict[tuple, tuple], set[tuple], int, int]:
+    """Map each (implant, config_type) to its baseline scope. Returns (scope_map, needed_models, skipped_excluded, skipped_unknown)."""
+    now = datetime.now(timezone.utc)
+    needed: set[tuple[str, str, str]] = set()
+    scope_map: dict[tuple[str, str], tuple[str, str]] = {}
+    skipped_excluded = 0
+    skipped_unknown = 0
+
+    for row in telemetry_rows:
+        config_type = row["config_type"]
+        if config_type in config.DETECTION_EXCLUDED_CONFIG_TYPES:
+            skipped_excluded += 1
+            continue
+        implant = implant_registry.get(row["implant_id"])
+        if implant is None:
+            skipped_unknown += 1
+            continue
+        scope, scope_id = resolve_baseline_scope(
+            redis_connection, row["implant_id"], implant["group_id"],
+            implant["first_seen"], config_type, now,
+        )
+        scope_map[(row["implant_id"], config_type)] = (scope, scope_id)
+        needed.add((scope, scope_id, config_type))
+
+    return scope_map, needed, skipped_excluded, skipped_unknown
+
+
+def load_needed_models(
+    redis_connection: redis_module.Redis,
+    needed: set[tuple],
+) -> dict[tuple, dict | None]:
+    """Load all required models from Redis into a cache dict."""
+    cache: dict[tuple, dict | None] = {}
+    for scope, scope_id, config_type in needed:
+        cache[(scope, scope_id, config_type)] = load_model_from_redis(
+            redis_connection, scope, scope_id, config_type,
+        )
+    loaded = sum(1 for model in cache.values() if model is not None)
+    logger.info("Loaded %d / %d models from Redis", loaded, len(needed))
+    return cache
+
+
 def build_model_cache(
     redis_connection: redis_module.Redis,
     telemetry_rows: list[dict],
     implant_registry: dict[str, dict],
 ) -> tuple[dict[tuple, dict | None], dict[tuple, tuple]]:
-    """
-    Pre-load every model hash needed to score this batch.
-    Returns (model_cache, scope_map) where:
-      - model_cache is keyed by (scope, scope_id, config_type) -> cached model or None
-      - scope_map is keyed by (implant_id, config_type) -> (scope, scope_id)
-    """
-    now = datetime.now(timezone.utc)
-    needed: set[tuple[str, str, str]] = set()
-    scope_map: dict[tuple[str, str], tuple[str, str]] = {}
-    skipped_excluded = 0
-    skipped_unknown_implant = 0
-
-    for row in telemetry_rows:
-        implant_id = row["implant_id"]
-        config_type = row["config_type"]
-        if config_type in config.DETECTION_EXCLUDED_CONFIG_TYPES:
-            skipped_excluded += 1
-            continue
-        implant = implant_registry.get(implant_id)
-        if implant is None:
-            skipped_unknown_implant += 1
-            continue
-
-        scope, scope_id = resolve_baseline_scope(
-            redis_connection, implant_id, implant["group_id"],
-            implant["first_seen"], config_type, now,
-        )
-
-        scope_map[(implant_id, config_type)] = (scope, scope_id)
-        needed.add((scope, scope_id, config_type))
-
-    model_cache: dict[tuple, dict | None] = {}
-    loaded_count = 0
-    missing_count = 0
-    for scope, scope_id, config_type in needed:
-        model = load_model_from_redis(redis_connection, scope, scope_id, config_type)
-        model_cache[(scope, scope_id, config_type)] = model
-        if model is not None:
-            loaded_count += 1
-        else:
-            missing_count += 1
-
+    """Pre-load every model hash needed to score this batch."""
+    scope_map, needed, skipped_excluded, skipped_unknown = resolve_scopes_for_batch(
+        redis_connection, telemetry_rows, implant_registry,
+    )
+    model_cache = load_needed_models(redis_connection, needed)
     logger.info(
-        "Model cache built: %d models loaded, %d missing, "
-        "%d rows excluded by config type, %d rows with unknown implant",
-        loaded_count, missing_count, skipped_excluded, skipped_unknown_implant,
+        "Model cache built: %d excluded, %d unknown implant",
+        skipped_excluded, skipped_unknown,
     )
     return model_cache, scope_map
 
@@ -185,12 +194,20 @@ def score_with_iqr(features: dict[str, float], fences: dict) -> list[FeatureDevi
 def score_with_isolation_forest(features: dict[str, float], model) -> float:
     """
     Return a normalised anomaly score in [0, 1] where 1 is most anomalous.
-    decision_function returns higher values for normal samples, so we flip it.
+
+    Uses z-score normalization against the training data's score distribution,
+    mapped through a sigmoid. Normal points cluster around 0.5; genuine
+    anomalies that are multiple standard deviations from the training mean
+    produce scores approaching 1.0.
     """
-    feature_names = model.feature_column_order
-    vector = np.array([[features.get(name, 0.0) for name in feature_names]])
+    active_features = model.active_features
+    vector = np.array([[features.get(name, 0.0) for name in active_features]])
     raw_score = model.decision_function(vector)[0]
-    return float(max(0.0, min(1.0, config.ISOLATION_FOREST_SCORE_OFFSET - raw_score)))
+
+    standard_deviation = max(model.train_score_std, 1e-6)
+    z_score = (model.train_score_mean - raw_score) / standard_deviation
+    sigmoid = 1.0 / (1.0 + np.exp(-z_score))
+    return float(max(0.0, min(1.0, sigmoid)))
 
 
 def fetch_unscored_telemetry(
@@ -293,6 +310,23 @@ def retrain_stale_baselines(
         logger.info("Retrained %d / %d baselines this tick", retrained, len(window_keys))
 
 
+def score_all_rows(
+    telemetry_rows: list[dict],
+    scope_map: dict[tuple, tuple],
+    model_cache: dict[tuple, dict | None],
+) -> list[ScoredEvent]:
+    """Score each telemetry row, returning only successfully scored events."""
+    scored_events = []
+    for row in telemetry_rows:
+        try:
+            scored = score_row_with_cache(row, scope_map, model_cache)
+            if scored is not None:
+                scored_events.append(scored)
+        except Exception:
+            logger.error("Scoring failed for row id=%s", row.get("id"), exc_info=True)
+    return scored_events
+
+
 def score_telemetry_batch(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
@@ -301,79 +335,71 @@ def score_telemetry_batch(
     """Score a batch of telemetry rows and pass results to the alert engine."""
     implant_registry = fetch_all_implants(db_connection)
     model_cache, scope_map = build_model_cache(
-        redis_connection, telemetry_rows, implant_registry
+        redis_connection, telemetry_rows, implant_registry,
     )
+    scored_events = score_all_rows(telemetry_rows, scope_map, model_cache)
+    anomalous = sum(1 for event in scored_events if event.deviating_features)
+    logger.info("Scored %d / %d rows (%d with deviations)",
+                len(scored_events), len(telemetry_rows), anomalous)
 
     now = datetime.now(timezone.utc)
-    window_start = now - timedelta(minutes=config.DETECTION_WINDOW_MINUTES)
-    window_end = now
-
-    scored_events = []
-    skipped_count = 0
-    for row in telemetry_rows:
-        try:
-            scored = score_row_with_cache(row, scope_map, model_cache)
-            if scored is not None:
-                scored_events.append(scored)
-            else:
-                skipped_count += 1
-        except Exception:
-            logger.error("Scoring failed for telemetry row id=%s", row.get("id"), exc_info=True)
-
-    anomalous_count = sum(
-        1 for event in scored_events if event.deviating_features
+    process_scored_events(
+        db_connection, scored_events,
+        now - timedelta(minutes=config.DETECTION_WINDOW_MINUTES), now,
     )
-    logger.info(
-        "Scored %d / %d rows (%d skipped, %d with deviations)",
-        len(scored_events), len(telemetry_rows), skipped_count, anomalous_count,
-    )
-    process_scored_events(db_connection, scored_events, window_start, window_end)
+
+
+def run_single_tick(
+    db_connection: psycopg2.extensions.connection,
+    redis_connection: redis_module.Redis,
+    last_processed_id: int,
+) -> tuple[int, bool]:
+    """Execute one detection tick. Returns (updated last_processed_id, has_more_rows)."""
+    retrain_stale_baselines(db_connection, redis_connection)
+    telemetry_rows = fetch_unscored_telemetry(db_connection, last_processed_id)
+    if not telemetry_rows:
+        logger.info("No new telemetry since id %d", last_processed_id)
+        return last_processed_id, False
+
+    score_telemetry_batch(db_connection, redis_connection, telemetry_rows)
+    new_cursor = max(row["id"] for row in telemetry_rows)
+    has_more = len(telemetry_rows) >= config.MAX_ROWS_PER_DETECTION_TICK
+    logger.info("Advanced cursor to telemetry id %d (has_more=%s)", new_cursor, has_more)
+    return new_cursor, has_more
 
 
 def run() -> None:
-    logger.info("Connecting to PostgreSQL at %s", config.DB_DSN.split("@")[-1])
+    logger.info("Connecting to PostgreSQL and Redis")
     db_connection = psycopg2.connect(config.DB_DSN)
-    logger.info("PostgreSQL connection established")
-
-    logger.info("Connecting to Redis at %s:%d", config.REDIS_HOST, config.REDIS_PORT)
     redis_connection = redis_module.Redis(
-        host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False
+        host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
-    logger.info("Redis connection established")
 
-    last_processed_id = get_max_telemetry_id(db_connection)
-    logger.info(
-        "Detector ready — tick interval %ds, starting from telemetry id %d, "
-        "max rows/tick %d, excluded config types: %s",
-        config.DETECTION_WINDOW_MINUTES * 60,
-        last_processed_id,
-        config.MAX_ROWS_PER_DETECTION_TICK,
-        config.DETECTION_EXCLUDED_CONFIG_TYPES or "(none)",
-    )
+    baseline_cursor = redis_connection.get("detector:baseline_cursor")
+    if baseline_cursor is not None:
+        last_processed_id = int(baseline_cursor)
+        logger.info("Resuming from baseline cursor stored in Redis: %d", last_processed_id)
+    else:
+        last_processed_id = get_max_telemetry_id(db_connection)
+    logger.info("Detector ready — starting from telemetry id %d", last_processed_id)
 
     tick_number = 0
     while True:
         tick_number += 1
-        tick_start_time = time.monotonic()
-        logger.info("=== Detection tick #%d started ===", tick_number)
-
+        tick_start = time.monotonic()
+        logger.info("=== Tick #%d ===", tick_number)
+        has_more = False
         try:
-            retrain_stale_baselines(db_connection, redis_connection)
-
-            telemetry_rows = fetch_unscored_telemetry(db_connection, last_processed_id)
-            if telemetry_rows:
-                score_telemetry_batch(db_connection, redis_connection, telemetry_rows)
-                last_processed_id = max(row["id"] for row in telemetry_rows)
-                logger.info("Advanced cursor to telemetry id %d", last_processed_id)
-            else:
-                logger.info("No new telemetry since id %d", last_processed_id)
-
+            last_processed_id, has_more = run_single_tick(
+                db_connection, redis_connection, last_processed_id,
+            )
         except Exception:
-            logger.critical("Detection tick #%d failed", tick_number, exc_info=True)
-
-        tick_duration = time.monotonic() - tick_start_time
-        logger.info("=== Detection tick #%d completed in %.1fs ===", tick_number, tick_duration)
-        time.sleep(config.DETECTION_WINDOW_MINUTES * 60)
+            logger.critical("Tick #%d failed", tick_number, exc_info=True)
+        logger.info("Tick #%d done in %.1fs", tick_number, time.monotonic() - tick_start)
+        if has_more:
+            logger.info("Backlog detected — running next tick immediately")
+        else:
+            time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
 
 
 if __name__ == "__main__":
