@@ -15,7 +15,6 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
-import numpy as np
 import psycopg2
 import psycopg2.extensions
 import psycopg2.extras
@@ -25,8 +24,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
 from alerts.engine import process_scored_events
-from alerts.models import FeatureDeviation, ScoredEvent
+from alerts.models import ScoredEvent
 from detection.baseline import load_model_from_redis, refresh_baseline, should_retrain
+from detection.scoring import score_with_iqr, score_with_isolation_forest
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,64 +152,6 @@ def build_model_cache(
     return model_cache, scope_map
 
 
-def compute_iqr_deviation(observed_value: float, fence_data: dict) -> float | None:
-    """Return the IQR deviation in fence units, or None if the value is within bounds."""
-    lower_fence = fence_data["lower_fence"]
-    upper_fence = fence_data["upper_fence"]
-
-    if lower_fence <= observed_value <= upper_fence:
-        return None
-
-    iqr = fence_data["IQR"]
-    if iqr <= 0:
-        return config.ZERO_IQR_DEVIATION_SENTINEL
-
-    distance_outside = (
-        lower_fence - observed_value
-        if observed_value < lower_fence
-        else observed_value - upper_fence
-    )
-    return distance_outside / iqr
-
-
-def score_with_iqr(features: dict[str, float], fences: dict) -> list[FeatureDeviation]:
-    """Check each feature against IQR fences; return the list of deviations."""
-    deviations = []
-    for feature_name, observed_value in features.items():
-        if feature_name not in fences:
-            continue
-        iqr_units = compute_iqr_deviation(observed_value, fences[feature_name])
-        if iqr_units is not None:
-            deviations.append(FeatureDeviation(
-                feature_name=feature_name,
-                observed_value=observed_value,
-                expected_median=fences[feature_name]["median"],
-                lower_fence=fences[feature_name]["lower_fence"],
-                upper_fence=fences[feature_name]["upper_fence"],
-                iqr_multiplier=iqr_units,
-            ))
-    return deviations
-
-
-def score_with_isolation_forest(features: dict[str, float], model) -> float:
-    """
-    Return a normalised anomaly score in [0, 1] where 1 is most anomalous.
-
-    Uses z-score normalization against the training data's score distribution,
-    mapped through a sigmoid. Normal points cluster around 0.5; genuine
-    anomalies that are multiple standard deviations from the training mean
-    produce scores approaching 1.0.
-    """
-    active_features = model.active_features
-    vector = np.array([[features.get(name, 0.0) for name in active_features]])
-    raw_score = model.decision_function(vector)[0]
-
-    standard_deviation = max(model.train_score_std, 1e-6)
-    z_score = (model.train_score_mean - raw_score) / standard_deviation
-    sigmoid = 1.0 / (1.0 + np.exp(-z_score))
-    return float(max(0.0, min(1.0, sigmoid)))
-
-
 def fetch_unscored_telemetry(
     db_connection: psycopg2.extensions.connection,
     last_processed_id: int,
@@ -294,6 +236,7 @@ def retrain_stale_baselines(
     """Check all window keys and retrain any baselines that need refreshing."""
     window_keys = discover_window_keys(redis_connection)
     retrained = 0
+    failures: list[tuple[str, str, str, Exception]] = []
     for scope, scope_id, config_type in window_keys:
         if should_retrain(redis_connection, scope, scope_id, config_type):
             try:
@@ -301,13 +244,20 @@ def retrain_stale_baselines(
                     redis_connection, db_connection, scope, scope_id, config_type
                 )
                 retrained += 1
-            except Exception:
+            except Exception as exception:
                 logger.error(
                     "Baseline refresh failed for %s:%s:%s", scope, scope_id, config_type,
                     exc_info=True,
                 )
+                failures.append((scope, scope_id, config_type, exception))
     if retrained > 0:
         logger.info("Retrained %d / %d baselines this tick", retrained, len(window_keys))
+    if failures:
+        logger.warning(
+            "%d baseline refresh(es) failed: %s",
+            len(failures),
+            ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct, _ in failures),
+        )
 
 
 def score_all_rows(
@@ -317,13 +267,21 @@ def score_all_rows(
 ) -> list[ScoredEvent]:
     """Score each telemetry row, returning only successfully scored events."""
     scored_events = []
+    failures: list[tuple[int | None, Exception]] = []
     for row in telemetry_rows:
         try:
             scored = score_row_with_cache(row, scope_map, model_cache)
             if scored is not None:
                 scored_events.append(scored)
-        except Exception:
+        except Exception as exception:
             logger.error("Scoring failed for row id=%s", row.get("id"), exc_info=True)
+            failures.append((row.get("id"), exception))
+    if failures:
+        logger.warning(
+            "%d row(s) failed scoring: %s",
+            len(failures),
+            ", ".join(str(row_id) for row_id, _ in failures),
+        )
     return scored_events
 
 
@@ -370,7 +328,7 @@ def run_single_tick(
 
 def run() -> None:
     logger.info("Connecting to PostgreSQL and Redis")
-    db_connection = psycopg2.connect(config.DB_DSN)
+    db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )

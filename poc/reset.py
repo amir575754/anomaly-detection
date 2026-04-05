@@ -70,8 +70,8 @@ def truncate_all_tables(database_connection) -> None:
 
 def reset_postgresql() -> None:
     """Truncate all application tables, terminating other connections first."""
-    logger.info("PostgreSQL: connecting to %s", config.DB_DSN.split("@")[-1])
-    database_connection = psycopg2.connect(config.DB_DSN)
+    logger.info("PostgreSQL: connecting to %s", config.DATABASE_DSN.split("@")[-1])
+    database_connection = psycopg2.connect(config.DATABASE_DSN)
     database_connection.autocommit = True
     try:
         log_table_row_counts(database_connection)

@@ -1,0 +1,93 @@
+"""
+Message parsing and batch preparation. Transforms raw Kafka JSON payloads
+into rows ready for PostgreSQL and Redis window commands.
+"""
+
+import json
+import logging
+from datetime import datetime, timezone
+
+from extraction.extractor import extract_features
+
+logger = logging.getLogger(__name__)
+
+
+def parse_received_at(timestamp_string: str) -> datetime:
+    """Parse the DD-MM-YYYY HH:MM:SS[.ff] format used in telemetry metadata."""
+    for format_string in ("%d-%m-%Y %H:%M:%S.%f", "%d-%m-%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(timestamp_string, format_string).replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognised timestamp format: {timestamp_string!r}")
+
+
+def build_window_commands(
+    implant_id: str, group_id: str, config_type: str, features_json: str,
+) -> list[tuple[str, str]]:
+    """Build Redis window push commands for both implant and group scopes."""
+    return [
+        (f"window:implant:{implant_id}:{config_type}", features_json),
+        (f"window:group:{group_id}:{config_type}", features_json),
+    ]
+
+
+def parse_message(message: dict) -> tuple[tuple, tuple, list[tuple[str, str]]]:
+    """Extract implant row, telemetry row, and window commands from one message."""
+    metadata = message["metadata"]
+    implant_id = str(metadata["implant_id"])
+    group_id = str(metadata["group_id"])
+    config_type = metadata["type"]
+    received_at = parse_received_at(metadata["received_at"])
+    ground_truth = message.get("ground_truth", {})
+
+    features_json = json.dumps(extract_features(message["configuration"], config_type))
+    is_anomaly = bool(ground_truth.get("is_anomaly", False))
+
+    implant_row = (implant_id, group_id, received_at, received_at)
+    telemetry_row = (
+        implant_id, config_type, received_at,
+        json.dumps(message), features_json, is_anomaly,
+        ground_truth.get("injector_tag"),
+    )
+    return implant_row, telemetry_row, build_window_commands(implant_id, group_id, config_type, features_json)
+
+
+def deduplicate_implants(implant_map: dict[str, tuple], implant_row: tuple) -> None:
+    """Merge an implant row into the map, keeping the earliest first_seen and latest last_seen."""
+    implant_id = implant_row[0]
+    existing = implant_map.get(implant_id)
+    if existing is None:
+        implant_map[implant_id] = implant_row
+    else:
+        implant_map[implant_id] = (
+            implant_id,
+            implant_row[1],
+            min(existing[2], implant_row[2]),
+            max(existing[3], implant_row[3]),
+        )
+
+
+def prepare_batch_rows(batch: list[dict]) -> tuple[list, list, list[tuple[str, str]]]:
+    """
+    Parse a batch of raw Kafka messages into rows for PostgreSQL and Redis.
+    Returns (implant_rows, telemetry_rows, window_commands).
+    """
+    implant_map: dict[str, tuple] = {}
+    telemetry_rows = []
+    window_commands: list[tuple[str, str]] = []
+
+    for message in batch:
+        implant_row, telemetry_row, commands = parse_message(message)
+        deduplicate_implants(implant_map, implant_row)
+        telemetry_rows.append(telemetry_row)
+        window_commands.extend(commands)
+
+    implant_rows = list(implant_map.values())
+    logger.debug(
+        "Prepared batch: %d unique implants, %d telemetry rows, %d window commands",
+        len(implant_rows), len(telemetry_rows), len(window_commands),
+    )
+    return implant_rows, telemetry_rows, window_commands

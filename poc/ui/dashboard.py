@@ -60,8 +60,8 @@ def get_database_connection() -> psycopg2.extensions.connection:
     """Return a cached database connection, reconnecting if it was closed."""
     connection = st.session_state.get("database_connection")
     if connection is None or connection.closed:
-        logger.info("Establishing new PostgreSQL connection to %s", config.DB_DSN.split("@")[-1])
-        connection = psycopg2.connect(config.DB_DSN)
+        logger.info("Establishing new PostgreSQL connection to %s", config.DATABASE_DSN.split("@")[-1])
+        connection = psycopg2.connect(config.DATABASE_DSN)
         st.session_state["database_connection"] = connection
     return connection
 
