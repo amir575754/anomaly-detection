@@ -23,6 +23,8 @@ class DetectionSummary:
         self.total_scored: int = 0
         self.total_printed: int = 0
         self.total_suppressed: int = 0
+        self.true_positives: int = 0
+        self.false_positives: int = 0
 
     def record(self, event: ScoredEvent, severity: Severity) -> None:
         """Record a printed detection."""
@@ -30,10 +32,13 @@ class DetectionSummary:
         self.severity_counts[severity.value] += 1
         row = event.telemetry_row
         self.config_type_counts[row["config_type"]] += 1
-        injector_tag = row.get("injector_tag")
-        if injector_tag and row.get("is_anomaly"):
+        if row.get("is_anomaly") and row.get("injector_tag"):
+            self.true_positives += 1
+            injector_tag = row["injector_tag"]
             normalized = injector_tag.split(":")[0] if ":" in injector_tag else injector_tag
             self.injector_counts[normalized] += 1
+        else:
+            self.false_positives += 1
 
     def record_suppressed(self) -> None:
         self.total_suppressed += 1
@@ -70,13 +75,15 @@ class DetectionSummary:
                 injector_table.add_row(tag, str(count))
             console.print(injector_table)
 
-        detection_rate = (
-            f"{self.total_printed / self.total_scored:.1%}"
-            if self.total_scored > 0
-            else "N/A"
-        )
-        console.print(
-            f"\n[bold]Overall:[/bold] scored={self.total_scored}  "
-            f"detected={self.total_printed}  suppressed={self.total_suppressed}  "
-            f"detection_rate={detection_rate}\n"
-        )
+        stats_table = Table(title="Overall Stats", show_lines=False)
+        stats_table.add_column("Metric", style="bold")
+        stats_table.add_column("Value", justify="right")
+        stats_table.add_row("Scored", str(self.total_scored))
+        stats_table.add_row("Detected", str(self.total_printed))
+        stats_table.add_row("Suppressed (IF-only MEDIUM)", str(self.total_suppressed))
+        stats_table.add_row("[green]True positives[/green]", f"[green]{self.true_positives}[/green]")
+        stats_table.add_row("[red]False positives[/red]", f"[red]{self.false_positives}[/red]")
+        if self.total_printed > 0:
+            fp_rate = self.false_positives / self.total_printed
+            stats_table.add_row("FP rate", f"{fp_rate:.1%}")
+        console.print(stats_table)

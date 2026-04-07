@@ -78,22 +78,24 @@ def shell_command(module: str) -> str:
     return f"source {_QUOTED_VENV_ACTIVATE} && cd {_QUOTED_POC_DIR} && python -m {module}"
 
 
+def _pane_command(module: str, label: str) -> str:
+    """Build a pane command that waits for tmux to settle before starting."""
+    return f"sleep 2 && {shell_command(module)}; read -p \"[{label} exited] press enter to close\""
+
+
 def create_tmux_panes() -> None:
     """Create the tmux session with three panes for ingestor, detector, and generator."""
-    ingestor_command = shell_command("ingestion.ingestor")
-    detector_command = shell_command("detection.detector")
-    generator_command = shell_command("data.generator")
     run_command(
         f"tmux new-session -d -s {SESSION_NAME} -n demo "
-        f"'{ingestor_command}; read -p \"[ingestor exited] press enter to close\"'"
+        f"'{_pane_command('ingestion.ingestor', 'ingestor')}'"
     )
     run_command(
         f"tmux split-window -h -t {SESSION_NAME}:demo "
-        f"'{detector_command}; read -p \"[detector exited] press enter to close\"'"
+        f"'{_pane_command('detection.detector', 'detector')}'"
     )
     run_command(
         f"tmux split-window -v -t {SESSION_NAME}:demo.0 -l 30% "
-        f"'{generator_command}; read -p \"[generator exited] press enter to close\"'"
+        f"'{_pane_command('data.generator', 'generator')}'"
     )
 
 
