@@ -124,8 +124,11 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    from rich.logging import RichHandler
+
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        format="%(name)s — %(message)s",
+        handlers=[RichHandler(rich_tracebacks=True, show_time=True)],
     )
     run()
