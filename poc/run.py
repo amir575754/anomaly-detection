@@ -99,12 +99,13 @@ def create_tmux_panes() -> None:
 
 def configure_tmux_labels() -> None:
     """Set pane titles and border formatting for the tmux session."""
+    # After splits, pane order is: 0=ingestor (top-left), 1=generator (bottom-left), 2=detector (right)
     run_command(f"tmux select-pane -t {SESSION_NAME}:demo.0 -T 'INGESTOR'")
-    run_command(f"tmux select-pane -t {SESSION_NAME}:demo.1 -T 'DETECTOR'")
-    run_command(f"tmux select-pane -t {SESSION_NAME}:demo.2 -T 'GENERATOR'")
+    run_command(f"tmux select-pane -t {SESSION_NAME}:demo.1 -T 'GENERATOR'")
+    run_command(f"tmux select-pane -t {SESSION_NAME}:demo.2 -T 'DETECTOR'")
     run_command(f"tmux set-option -t {SESSION_NAME} pane-border-status top")
     run_command(f"tmux set-option -t {SESSION_NAME} pane-border-format ' #{{pane_title}} '")
-    run_command(f"tmux select-pane -t {SESSION_NAME}:demo.1")
+    run_command(f"tmux select-pane -t {SESSION_NAME}:demo.2")
 
 
 def launch_tmux() -> None:
