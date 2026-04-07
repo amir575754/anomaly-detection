@@ -25,7 +25,7 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config  # noqa: E402 — path setup required before import
-from detection.models import TrainedModel
+from detection.trained_model import TrainedModel
 
 logger = logging.getLogger(__name__)
 

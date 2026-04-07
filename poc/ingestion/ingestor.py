@@ -22,10 +22,6 @@ import config
 from ingestion.parser import prepare_batch_rows
 from ingestion.writers import write_to_postgresql, write_to_redis
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 
@@ -162,4 +158,8 @@ def run() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     run()

@@ -1,7 +1,7 @@
 """
 Detection engine. Runs in a loop: retrains stale baselines, fetches unscored
 telemetry from PostgreSQL, scores each event against IQR fences and Isolation
-Forest, then passes ScoredEvents to the alert engine.
+Forest, and prints detected anomalies to the CLI.
 
 Uses cursor-based fetching (last processed telemetry ID) instead of wall-clock
 windows so that bursts of data during the demo's fast-forward mode are never
@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import psycopg2
 import psycopg2.extensions
@@ -23,16 +23,16 @@ import redis as redis_module
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config  # noqa: E402 — path setup required before import
-from alerts.engine import process_scored_events
-from alerts.models import ScoredEvent
 from detection.baseline import load_model_from_redis, refresh_baseline, should_retrain
 from detection.keys import parse_window_key
-from detection.scoring import score_with_iqr, score_with_isolation_forest, explain_isolation_forest
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+from detection.models import ScoredEvent, Severity
+from detection.scoring import (
+    determine_severity,
+    explain_isolation_forest,
+    score_with_iqr,
+    score_with_isolation_forest,
 )
+
 logger = logging.getLogger(__name__)
 
 
@@ -289,25 +289,76 @@ def score_all_rows(
     return scored_events
 
 
+SEVERITY_COLORS = {
+    Severity.HIGH: "\033[91m",    # red
+    Severity.MEDIUM: "\033[93m",  # yellow
+    Severity.LOW: "\033[96m",     # cyan
+}
+RESET_COLOR = "\033[0m"
+DIM = "\033[2m"
+
+
+def format_detection(event: ScoredEvent, severity: Severity) -> str:
+    """Format a scored event as a human-readable CLI detection line."""
+    row = event.telemetry_row
+    color = SEVERITY_COLORS.get(severity, "")
+    lines = [
+        f"{color}[{severity.value}]{RESET_COLOR} "
+        f"{row['implant_id']} ({row['group_id']}) {row['config_type']}"
+    ]
+    for deviation in event.deviating_features:
+        lines.append(
+            f"  ├─ IQR: {deviation.feature_name} = {deviation.observed_value:.4g} "
+            f"{DIM}(expected {deviation.lower_fence:.4g}–{deviation.upper_fence:.4g}, "
+            f"median {deviation.expected_median:.4g}){RESET_COLOR}"
+        )
+    if event.shap_contributions and not event.deviating_features:
+        shap_parts = ", ".join(
+            f"{c.feature_name} ({c.contribution:+.3f})"
+            for c in event.shap_contributions
+        )
+        lines.append(f"  ├─ SHAP: {shap_parts}")
+    lines.append(f"  └─ IF score: {event.isolation_forest_score:.3f}")
+    return "\n".join(lines)
+
+
+def print_detections(scored_events: list[ScoredEvent]) -> int:
+    """Determine severity and print detected anomalies. Returns count printed.
+
+    Prints HIGH (IQR + IF agree), MEDIUM only when IQR flagged something,
+    and LOW (IF-only with high score). Skips MEDIUM events with no IQR
+    evidence to keep the CLI readable without deduplication.
+    """
+    printed = 0
+    suppressed = 0
+    for event in scored_events:
+        severity = determine_severity(event.deviating_features, event.isolation_forest_score)
+        if severity is None:
+            continue
+        if severity == Severity.MEDIUM and not event.deviating_features:
+            suppressed += 1
+            continue
+        print(format_detection(event, severity))
+        printed += 1
+    if suppressed:
+        logger.debug("Suppressed %d IF-only MEDIUM events (no IQR evidence)", suppressed)
+    return printed
+
+
 def score_telemetry_batch(
-    db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
     telemetry_rows: list[dict],
+    implant_registry: dict[str, dict],
 ) -> None:
-    """Score a batch of telemetry rows and pass results to the alert engine."""
-    implant_registry = fetch_all_implants(db_connection)
+    """Score a batch of telemetry rows and print detected anomalies."""
     model_cache, scope_map = build_model_cache(
         redis_connection, telemetry_rows, implant_registry,
     )
     scored_events = score_all_rows(telemetry_rows, scope_map, model_cache)
-    anomalous = sum(1 for event in scored_events if event.deviating_features)
-    logger.info("Scored %d / %d rows (%d with deviations)",
-                len(scored_events), len(telemetry_rows), anomalous)
-
-    now = datetime.now(timezone.utc)
-    process_scored_events(
-        db_connection, scored_events,
-        now - timedelta(minutes=config.DETECTION_WINDOW_MINUTES), now,
+    detected = print_detections(scored_events)
+    logger.info(
+        "Scored %d rows, %d detections printed",
+        len(telemetry_rows), detected,
     )
 
 
@@ -323,11 +374,15 @@ def run_single_tick(
         logger.info("No new telemetry since id %d", last_processed_id)
         return last_processed_id, False
 
-    score_telemetry_batch(db_connection, redis_connection, telemetry_rows)
+    implant_registry = fetch_all_implants(db_connection)
+    score_telemetry_batch(redis_connection, telemetry_rows, implant_registry)
     new_cursor = max(row["id"] for row in telemetry_rows)
     has_more = len(telemetry_rows) >= config.MAX_ROWS_PER_DETECTION_TICK
     logger.info("Advanced cursor to telemetry id %d (has_more=%s)", new_cursor, has_more)
     return new_cursor, has_more
+
+
+MAX_CONSECUTIVE_FAILURES = 5
 
 
 def run() -> None:
@@ -337,32 +392,48 @@ def run() -> None:
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
 
-    baseline_cursor = redis_connection.get("detector:baseline_cursor")
-    if baseline_cursor is not None:
-        last_processed_id = int(baseline_cursor)
-        logger.info("Resuming from baseline cursor stored in Redis: %d", last_processed_id)
-    else:
-        last_processed_id = get_max_telemetry_id(db_connection)
-    logger.info("Detector ready — starting from telemetry id %d", last_processed_id)
-
-    tick_number = 0
-    while True:
-        tick_number += 1
-        tick_start = time.monotonic()
-        logger.info("=== Tick #%d ===", tick_number)
-        has_more = False
-        try:
-            last_processed_id, has_more = run_single_tick(
-                db_connection, redis_connection, last_processed_id,
-            )
-        except Exception:
-            logger.critical("Tick #%d failed", tick_number, exc_info=True)
-        logger.info("Tick #%d done in %.1fs", tick_number, time.monotonic() - tick_start)
-        if has_more:
-            logger.info("Backlog detected — running next tick immediately")
-        else:
+    try:
+        baseline_cursor = redis_connection.get("detector:baseline_cursor")
+        while baseline_cursor is None:
+            logger.info("Waiting for baseline phase to complete (no cursor in Redis yet)...")
             time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
+            baseline_cursor = redis_connection.get("detector:baseline_cursor")
+
+        last_processed_id = int(baseline_cursor)
+        logger.info("Baseline cursor found — starting detection from telemetry id %d", last_processed_id)
+
+        tick_number = 0
+        consecutive_failures = 0
+        while True:
+            tick_number += 1
+            tick_start = time.monotonic()
+            logger.info("=== Tick #%d ===", tick_number)
+            has_more = False
+            try:
+                last_processed_id, has_more = run_single_tick(
+                    db_connection, redis_connection, last_processed_id,
+                )
+                consecutive_failures = 0
+            except Exception:
+                consecutive_failures += 1
+                logger.critical("Tick #%d failed (%d consecutive)", tick_number, consecutive_failures, exc_info=True)
+                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    raise RuntimeError(
+                        f"Aborting after {MAX_CONSECUTIVE_FAILURES} consecutive tick failures"
+                    )
+            logger.info("Tick #%d done in %.1fs", tick_number, time.monotonic() - tick_start)
+            if has_more:
+                logger.info("Backlog detected — running next tick immediately")
+            else:
+                time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
+    finally:
+        db_connection.close()
+        redis_connection.close()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     run()
