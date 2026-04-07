@@ -10,11 +10,12 @@ import psycopg2.extras
 import redis as redis_module
 
 import config
+from ingestion.parser import ImplantRow, TelemetryRow, WindowCommand
 
 logger = logging.getLogger(__name__)
 
 
-def upsert_implants(cursor, implant_rows: list) -> None:
+def upsert_implants(cursor, implant_rows: list[ImplantRow]) -> None:
     """Upsert implant rows, merging first_seen and last_seen timestamps."""
     psycopg2.extras.execute_values(
         cursor,
@@ -31,7 +32,7 @@ def upsert_implants(cursor, implant_rows: list) -> None:
     )
 
 
-def insert_telemetry(cursor, telemetry_rows: list) -> None:
+def insert_telemetry(cursor, telemetry_rows: list[TelemetryRow]) -> None:
     """Bulk-insert telemetry rows."""
     psycopg2.extras.execute_values(
         cursor,
@@ -46,8 +47,8 @@ def insert_telemetry(cursor, telemetry_rows: list) -> None:
 
 def write_to_postgresql(
     db_connection: psycopg2.extensions.connection,
-    implant_rows: list,
-    telemetry_rows: list,
+    implant_rows: list[ImplantRow],
+    telemetry_rows: list[TelemetryRow],
 ) -> None:
     """Bulk-insert implant and telemetry rows."""
     logger.debug(
@@ -63,7 +64,7 @@ def write_to_postgresql(
 
 def write_to_redis(
     redis_connection: redis_module.Redis,
-    window_commands: list[tuple[str, str]],
+    window_commands: list[WindowCommand],
 ) -> None:
     """Push feature vectors to sliding windows and increment write counters."""
     pipeline = redis_connection.pipeline(transaction=False)
