@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import psycopg2
+import psycopg2.extensions
 import redis as redis_module
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
@@ -26,10 +27,6 @@ from data.profiles import generate_snapshot, sample_config_type
 from detection.baseline import refresh_baseline
 from detection.keys import parse_window_key
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
 
 _MINUTES_PER_SNAPSHOT: int = (24 * 60) // config.SNAPSHOTS_PER_IMPLANT_PER_DAY
@@ -49,7 +46,9 @@ def ensure_topic_exists(bootstrap: str, topic: str) -> None:
     admin = AdminClient({"bootstrap.servers": bootstrap})
     existing_topics = admin.list_topics(timeout=10).topics
     if topic not in existing_topics:
-        admin.create_topics([NewTopic(topic, num_partitions=1, replication_factor=1)])
+        futures = admin.create_topics([NewTopic(topic, num_partitions=1, replication_factor=1)])
+        for future in futures.values():
+            future.result()
         logger.info("Created Kafka topic %r", topic)
     else:
         logger.debug("Kafka topic %r already exists", topic)
@@ -129,7 +128,7 @@ def run_baseline_phase(producer: Producer, implants: list[tuple[str, str]]) -> i
     return total_published
 
 
-def poll_telemetry_count(db_connection) -> int:
+def poll_telemetry_count(db_connection: psycopg2.extensions.connection) -> int:
     """Return the current row count in the telemetry table."""
     with db_connection.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) FROM telemetry")
@@ -248,12 +247,13 @@ def generate_live_event(
     snapshot = generate_snapshot(implant_id, group_id)
     if random.random() < config.ANOMALY_RATE:
         anomalous_snapshot = inject_random_anomaly(snapshot)
-        logger.debug(
-            "Injected anomaly: implant=%s type=%s injector=%s",
-            implant_id, snapshot["metadata"]["type"],
-            anomalous_snapshot["ground_truth"].get("injector_tag"),
-        )
-        return anomalous_snapshot, True
+        if anomalous_snapshot is not None:
+            logger.debug(
+                "Injected anomaly: implant=%s type=%s injector=%s",
+                implant_id, snapshot["metadata"]["type"],
+                anomalous_snapshot["ground_truth"].get("injector_tag"),
+            )
+            return anomalous_snapshot, True
     return snapshot, False
 
 
@@ -359,4 +359,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    )
     main()

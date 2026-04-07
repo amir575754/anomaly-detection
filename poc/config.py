@@ -1,3 +1,5 @@
+from types import MappingProxyType
+
 # ---------------------------------------------------------------------------
 # Infrastructure
 # ---------------------------------------------------------------------------
@@ -49,10 +51,10 @@ ISOLATION_FOREST_RANDOM_STATE: int = 42
 # Minimum feature variance to include a feature in IF training (drops constant/near-constant features)
 FEATURE_VARIANCE_THRESHOLD: float = 0.001
 
-# Per-config-type IQR multiplier overrides (types not listed use IQR_MULTIPLIER) — do not mutate
-CONFIG_TYPE_IQR_OVERRIDES: dict[str, float] = {
+# Per-config-type IQR multiplier overrides (types not listed use IQR_MULTIPLIER)
+CONFIG_TYPE_IQR_OVERRIDES: MappingProxyType[str, float] = MappingProxyType({
     "dangerous_program_configuration": 1.5,
-}
+})
 
 # Maximum number of SHAP feature contributions included in alert explanations
 SHAP_TOP_N_FEATURES: int = 5
@@ -89,37 +91,14 @@ RETRAIN_THRESHOLD: int = 100
 # Detection engine
 # ---------------------------------------------------------------------------
 
-# Config types excluded from anomaly detection — do not mutate
-DETECTION_EXCLUDED_CONFIG_TYPES: list[str] = []
-
-# Nominal detection batch window in minutes (used for alert window labeling)
-DETECTION_WINDOW_MINUTES: int = 5
+# Config types excluded from anomaly detection
+DETECTION_EXCLUDED_CONFIG_TYPES: tuple[str, ...] = ()
 
 # Seconds the detector sleeps when no backlog remains
 DETECTION_IDLE_SLEEP_SECONDS: int = 3
 
 # Maximum telemetry rows scored per tick
 MAX_ROWS_PER_DETECTION_TICK: int = 5000
-
-
-# ---------------------------------------------------------------------------
-# Alert engine
-# ---------------------------------------------------------------------------
-
-# Window within which identical alert patterns are considered duplicates and suppressed
-DEDUP_WINDOW_MINUTES: int = 15
-
-# Maximum alerts raised per implant within one detection window
-RATE_LIMIT_PER_WINDOW: int = 3
-
-# Number of false_positive labels on the same pattern before it is permanently suppressed
-SUPPRESSION_LABEL_THRESHOLD: int = 3
-
-# Length of the truncated SHA-256 hash used to identify alert patterns
-PATTERN_HASH_LENGTH: int = 16
-
-# Hours after which a suppressed pattern expires and can trigger alerts again (0 = never expire)
-SUPPRESSION_DECAY_HOURS: int = 24
 
 
 # ---------------------------------------------------------------------------
@@ -169,14 +148,3 @@ KAFKA_POLL_TIMEOUT_SECONDS: float = 0.5
 
 # Number of processed messages between progress log lines
 INGESTOR_LOG_INTERVAL_MESSAGES: int = 2000
-
-
-# ---------------------------------------------------------------------------
-# Dashboard
-# ---------------------------------------------------------------------------
-
-# Maximum number of alerts fetched per dashboard refresh
-DASHBOARD_ALERT_LIMIT: int = 200
-
-# Seconds between dashboard auto-refreshes
-DASHBOARD_REFRESH_INTERVAL_SECONDS: int = 5

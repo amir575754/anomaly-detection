@@ -165,11 +165,11 @@ _INJECTORS_BY_CONFIG_TYPE = {
 }
 
 
-def inject_random_anomaly(snapshot: dict) -> dict:
-    """Apply a random applicable anomaly injector. Returns snapshot unchanged if none apply."""
+def inject_random_anomaly(snapshot: dict) -> dict | None:
+    """Apply a random applicable anomaly injector. Returns None if no injector applies."""
     config_type = snapshot["metadata"]["type"]
     applicable_injectors = _INJECTORS_BY_CONFIG_TYPE.get(config_type)
     if not applicable_injectors:
-        return snapshot
+        return None
     injector = random.choice(applicable_injectors)
     return injector(snapshot)

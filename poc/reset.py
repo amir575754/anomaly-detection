@@ -1,9 +1,9 @@
 """
 Reset all system state for a fresh demo run.
 
-Clears PostgreSQL tables (telemetry, alerts, baselines, suppressed_patterns,
-implants), flushes all Redis keys (window:*, model:*, writes:*), and deletes
-the Kafka topic so the generator recreates it on next startup.
+Clears PostgreSQL tables (telemetry, baselines, implants), flushes all Redis
+keys (window:*, model:*, writes:*, detector:*), and deletes the Kafka topic
+so the generator recreates it on next startup.
 
 Usage:
     python reset.py          # interactive confirmation
@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _APPLICATION_TABLES = (
-    "suppressed_patterns", "alerts", "baselines", "telemetry", "implants",
+    "baselines", "telemetry", "implants",
 )
 
 _REDIS_KEY_PATTERNS = ("window:*", "model:*", "writes:*", "detector:*")
@@ -91,17 +91,20 @@ def reset_redis() -> None:
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
 
-    total_deleted = 0
-    for pattern in _REDIS_KEY_PATTERNS:
-        keys = list(redis_connection.scan_iter(match=pattern))
-        if keys:
-            redis_connection.delete(*keys)
-            logger.info("  %s: deleted %d keys", pattern, len(keys))
-            total_deleted += len(keys)
-        else:
-            logger.info("  %s: no keys found", pattern)
+    try:
+        total_deleted = 0
+        for pattern in _REDIS_KEY_PATTERNS:
+            keys = list(redis_connection.scan_iter(match=pattern))
+            if keys:
+                redis_connection.delete(*keys)
+                logger.info("  %s: deleted %d keys", pattern, len(keys))
+                total_deleted += len(keys)
+            else:
+                logger.info("  %s: no keys found", pattern)
 
-    logger.info("Redis: deleted %d keys total", total_deleted)
+        logger.info("Redis: deleted %d keys total", total_deleted)
+    finally:
+        redis_connection.close()
 
 
 def reset_kafka() -> None:
@@ -130,7 +133,7 @@ def reset_kafka() -> None:
 def confirm_reset() -> bool:
     """Ask the user to confirm the reset. Returns True if confirmed."""
     answer = input(
-        "This will DELETE all telemetry, alerts, baselines, Redis state, "
+        "This will DELETE all telemetry, baselines, Redis state, "
         "and Kafka messages.\nType 'yes' to confirm: "
     )
     return answer.strip().lower() == "yes"

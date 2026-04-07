@@ -8,8 +8,8 @@ from __future__ import annotations
 import numpy as np
 
 import config
-from alerts.models import FeatureDeviation, ShapContribution
-from detection.models import TrainedModel
+from detection.models import FeatureDeviation, Severity, ShapContribution
+from detection.trained_model import TrainedModel
 
 
 def compute_iqr_deviation(observed_value: float, fence_data: dict) -> float | None:
@@ -86,3 +86,35 @@ def explain_isolation_forest(
     ]
     contributions.sort(key=lambda c: abs(c.contribution), reverse=True)
     return contributions[:config.SHAP_TOP_N_FEATURES]
+
+
+def determine_severity(
+    deviating_features: list[FeatureDeviation],
+    isolation_forest_score: float,
+) -> Severity | None:
+    """
+    Determine detection severity from IQR deviations and IF score.
+    Returns None if neither model finds anything worth reporting.
+    """
+    iqr_has_significant_deviation = (
+        len(deviating_features) >= config.IQR_SIGNIFICANT_FEATURE_COUNT
+        or any(
+            deviation.iqr_deviation > config.IQR_SIGNIFICANT_MULTIPLIER
+            for deviation in deviating_features
+        )
+    )
+    iqr_has_any_deviation = len(deviating_features) >= 1
+    isolation_forest_is_high = isolation_forest_score > config.ISOLATION_FOREST_HIGH_THRESHOLD
+    isolation_forest_is_medium = (
+        config.ISOLATION_FOREST_MEDIUM_THRESHOLD
+        <= isolation_forest_score
+        <= config.ISOLATION_FOREST_HIGH_THRESHOLD
+    )
+
+    if iqr_has_significant_deviation and isolation_forest_is_high:
+        return Severity.HIGH
+    if iqr_has_any_deviation or isolation_forest_is_medium:
+        return Severity.MEDIUM
+    if isolation_forest_is_high and not iqr_has_any_deviation:
+        return Severity.LOW
+    return None

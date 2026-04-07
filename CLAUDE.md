@@ -9,9 +9,8 @@ This is a **proof-of-concept** targeting a live demo. The architecture should re
 ## Project Overview
 
 - **Purpose:** Catch operator errors and operational risks across implants in near real-time
-- **Users:** NOC operators who receive alerts, classify them, and use feedback to improve detection
 - **Demo timing:** The complete demo (baseline + live + detection) must finish in under 3 minutes so it can be presented live to stakeholders
-- **Alert latency:** Detector must keep up with incoming telemetry — no multi-minute backlogs
+- **Detection latency:** Detector must keep up with incoming telemetry — no multi-minute backlogs
 - **Detection approach:** Fully autonomous (no manual rules/signatures); baseline learning at per-implant and per-group levels
 - **Scope:** Config snapshot telemetry only. Logs and non-config products are out of scope for the PoC.
 
@@ -19,11 +18,18 @@ This is a **proof-of-concept** targeting a live demo. The architecture should re
 
 ## Demo Flow
 
+The demo runs from a single command: `python run.py`
+
+This launches a tmux session with three panes:
+- **Ingestor** — Kafka consumer writing to PostgreSQL and Redis
+- **Detector** — scoring loop that prints detected anomalies to the CLI
+- **Generator** — baseline phase followed by live streaming with anomaly injection
+
 The demo runs in two phases:
 
-1. **Baseline phase (compressed time):** A dataset generator pre-populates the system with synthetic historical data representing normal implant behaviour across all groups. This data is ingested in bulk at maximum speed before the live phase starts. Per-implant baselines become active after `IMPLANT_BASELINE_MIN_DAYS` of data per implant; group baselines are used until then.
+1. **Baseline phase (compressed time):** The generator pre-populates the system with synthetic historical data. The ingestor writes it to PostgreSQL and Redis. After ingestion, baselines are computed and a cursor is saved so the detector knows where live data starts.
 
-2. **Live phase:** The generator streams a new wave of telemetry — ~4% of events are anomalous (injected using `anomalies.py`) — as fast as the pipeline can process. The Streamlit UI shows alerts appearing in real time as the detector processes each batch.
+2. **Live phase:** The generator streams new telemetry with ~4% anomalous events. The detector scores each event and prints detections with severity, IQR deviations, and SHAP feature contributions directly to the CLI.
 
 There is no time throttling. Everything runs as fast as possible.
 
@@ -35,8 +41,8 @@ There is no time throttling. Everything runs as fast as possible.
 poc/
 ├── docker-compose.yml
 ├── config.py                  # all tunable constants in one place
-├── CLAUDE.md
-├── README.md                  # user-facing demo documentation
+├── run.py                     # unified tmux launcher — single entry point for the demo
+├── reset.py                   # clears all state for a fresh run
 │
 ├── data/
 │   ├── profiles.py            # config snapshot generators (provided)
@@ -44,21 +50,19 @@ poc/
 │   └── generator.py           # orchestrates bulk baseline + live stream generation
 │
 ├── ingestion/
-│   └── ingestor.py            # Kafka consumer → PostgreSQL + Redis writer
+│   ├── ingestor.py            # Kafka consumer → PostgreSQL + Redis writer
+│   ├── parser.py              # message parsing
+│   └── writers.py             # PostgreSQL and Redis write logic
 │
 ├── extraction/
 │   └── extractor.py           # feature extraction per config type (provided, extend here)
 │
-├── detection/
-│   ├── baseline.py            # IQR and Isolation Forest baseline management
-│   └── detector.py            # runs detection against each incoming feature vector
-│
-├── alerts/
-│   ├── engine.py              # deduplication, severity scoring, fatigue mitigation
-│   └── models.py              # Alert dataclass and label enums
-│
-└── ui/
-    └── dashboard.py           # Streamlit NOC dashboard
+└── detection/
+    ├── models.py              # TrainedModel, ScoredEvent, FeatureDeviation, Severity
+    ├── keys.py                # shared Redis key format parsing
+    ├── baseline.py            # IQR and Isolation Forest baseline management
+    ├── scoring.py             # pure scoring functions (IQR, IF, SHAP, severity)
+    └── detector.py            # detection loop with CLI output
 ```
 
 **Provided files** (`profiles.py`, `anomalies.py`, `extractor.py`) should be copied into the repo and used as-is. Do not refactor them unless there is a concrete reason.
@@ -71,7 +75,7 @@ poc/
 
 | Service | Role |
 |---------|------|
-| **PostgreSQL** | Persistent storage for raw telemetry, extracted features, baselines, alerts, and feedback |
+| **PostgreSQL** | Persistent storage for raw telemetry, extracted features, and baselines |
 | **Kafka + Zookeeper** | Message stream between generator and ingestor. Single broker. |
 | **Redis** | Two roles: (1) sliding-window lists of raw feature vectors as training material for baselines; (2) cached computed baseline artefacts (IQR fences + serialised Isolation Forest models) so the detector doesn't retrain on every batch tick |
 
@@ -81,7 +85,7 @@ poc/
 |-----------|------------|
 | All application code | Python |
 | Detection models | `scikit-learn` (Isolation Forest + IQR) |
-| UI | Streamlit |
+| Explainability | `shap` (TreeExplainer for per-feature IF attribution) |
 | Kafka client | `confluent-kafka` |
 | PostgreSQL client | `psycopg2` |
 | Redis client | `redis-py` |
@@ -138,7 +142,7 @@ poc/
 
 ### Organizational Hierarchy
 
-Implants belong to **implant groups**. Groups are a first-class concept — they define the scope of shared behavioral baselines. Every detection and alert must be group-aware. Group names are arbitrary strings (e.g. ALPHA, BRAVO, CHARLIE in the synthetic data).
+Implants belong to **implant groups**. Groups are a first-class concept — they define the scope of shared behavioral baselines. Every detection must be group-aware. Group names are arbitrary strings (e.g. ALPHA, BRAVO, CHARLIE in the synthetic data).
 
 ---
 
@@ -196,7 +200,7 @@ Every feature vector is scored against two baselines:
 - **Per-implant baseline** — built from this implant's own history. Active after `IMPLANT_BASELINE_MIN_DAYS` of per-implant data.
 - **Per-group baseline** — built from all implants in the group. Always active.
 
-During the cold-start period for a given implant, only the group baseline is used. Once enough per-implant data exists, the per-implant result takes precedence. Alerts always indicate which baseline was used.
+During the cold-start period for a given implant, only the group baseline is used. Once enough per-implant data exists, the per-implant result takes precedence. Detections always indicate which baseline was used.
 
 ### Detection Models
 
@@ -205,94 +209,49 @@ Two models run in parallel on each feature vector.
 **IQR detector (statistical, per-feature):**
 - For each feature, compute Q1, Q3, and IQR from the baseline window
 - Flag the feature if the observed value falls outside `[Q1 - k*IQR, Q3 + k*IQR]` where `k` is configurable via `IQR_MULTIPLIER` in `config.py`
+- Fences are clamped at P1/P99 of the training data to prevent fences extending into impossible ranges for narrow-distribution features
 - IQR is robust to outliers and makes no assumptions about the underlying distribution
-- Produces per-feature deviation scores — the primary source of alert explainability
+- Produces per-feature deviation scores — the primary source of explainability
 
 **Isolation Forest (multivariate):**
-- Trained on the full feature vector for each (baseline scope, config type) combination
+- Trained on StandardScaler-normalized feature vectors for each (baseline scope, config type) combination
 - Catches anomalies that are subtle across multiple features but not extreme on any single one
-- One model instance per (scope, config type) pair, serialised and cached in Redis
+- One `TrainedModel` instance per (scope, config type) pair, serialised and cached in Redis
+- SHAP `TreeExplainer` attached to each trained model for per-feature anomaly attribution
 - Retrained whenever the baseline window is refreshed
 
-Both detectors must independently signal anomalous for a HIGH alert. Either alone produces MEDIUM or LOW (see Severity Scoring).
+Both detectors must independently signal anomalous for a HIGH detection. Either alone produces MEDIUM or LOW (see Severity Scoring).
 
 ### Severity Scoring
 
 | Level | Criteria |
 |-------|----------|
 | **HIGH** | Both detectors agree: IQR shows significant deviation (multiple features or extreme single-feature breach) AND Isolation Forest score exceeds the high threshold. |
-| **MEDIUM** | Either detector alone: any IQR deviation, or a moderate IF score. |
-| **LOW** | IF signal only, no IQR breach. |
+| **MEDIUM** | IQR flagged at least one feature deviation. |
+| **LOW** | IF score exceeds the high threshold, no IQR breach. SHAP contributions explain which features drove the IF decision. |
 
-All thresholds (`IQR_SIGNIFICANT_FEATURE_COUNT`, `IQR_SIGNIFICANT_MULTIPLIER`, `ISOLATION_FOREST_HIGH_THRESHOLD`, `ISOLATION_FOREST_MEDIUM_THRESHOLD`) are constants in `config.py`. Tune them to keep false positive noise low enough that the demo dashboard is readable.
+All thresholds (`IQR_SIGNIFICANT_FEATURE_COUNT`, `IQR_SIGNIFICANT_MULTIPLIER`, `ISOLATION_FOREST_HIGH_THRESHOLD`, `ISOLATION_FOREST_MEDIUM_THRESHOLD`) are constants in `config.py`.
+
+### CLI Output Format
+
+Detected anomalies are printed directly to the detector's stdout:
+
+```
+[HIGH] implant_ALPHA_003 (ALPHA) communication_configuration
+  ├─ IQR: beacon_interval_ms = 1200 (expected 25000–35000, median 30100)
+  ├─ IQR: jitter_percentage = 0.0 (expected 0.10–0.25, median 0.18)
+  └─ IF score: 0.987
+
+[LOW] implant_BRAVO_002 (BRAVO) communication_configuration
+  ├─ SHAP: beacon_interval_ms (-0.928), c2_enabled_count (-0.368), jitter_percentage (-0.340)
+  └─ IF score: 0.734
+```
+
+Only events with IQR evidence or a strong IF signal (above `ISOLATION_FOREST_HIGH_THRESHOLD`) are printed. MEDIUM events without IQR deviations are suppressed to keep the CLI readable.
 
 ### Detection Loop
 
-The detector runs in a continuous loop. When there is a backlog of unscored telemetry, it processes ticks back-to-back. When caught up, it sleeps briefly (`DETECTION_IDLE_SLEEP_SECONDS`) before polling again. This keeps alert latency low during the demo.
-
----
-
-## Alert Engine
-
-### Alert and Supporting Types
-
-```python
-@dataclass
-class FeatureDeviation:
-    feature_name: str
-    observed_value: float
-    expected_median: float
-    lower_fence: float
-    upper_fence: float
-    iqr_multiplier: float       # how many IQR units outside the fence
-
-@dataclass
-class Alert:
-    alert_id: str               # UUID
-    implant_id: str
-    group_id: str
-    config_type: str
-    timestamp: datetime
-    window_start: datetime
-    window_end: datetime
-    severity: Severity          # HIGH / MEDIUM / LOW
-    baseline_used: str          # "implant" or "group"
-    deviating_features: list[FeatureDeviation]
-    isolation_forest_score: float
-    explanation: str            # human-readable, auto-generated
-    label: Label | None         # set by operator
-```
-
-### Explanation Generation
-
-Auto-generate `explanation` from `deviating_features`. Format:
-
-> "Implant 0x1337 (group ALPHA): `beacon_interval_ms` is 1200 (expected 28000–32000, median 30100). `jitter_percentage` is 0.0 (expected 0.10–0.22). Severity: HIGH."
-
-### Fatigue Mitigation
-
-- **Deduplication:** suppress duplicate alerts for the same (implant, config type, deviating feature set) within `DEDUP_WINDOW_MINUTES`
-- **Rate limiting:** max `RATE_LIMIT_PER_WINDOW` alerts per implant per detection tick
-- **False positive suppression:** if an alert pattern accumulates enough `false_positive` labels (threshold: `SUPPRESSION_LABEL_THRESHOLD`), suppress it and log the suppression
-
----
-
-## Feedback Loop
-
-### Operator Label Set
-
-| Label | Value |
-|-------|-------|
-| True Positive | `true_positive` |
-| False Positive | `false_positive` |
-| Expected Deviation | `expected_deviation` |
-
-### Feedback Behaviour (PoC)
-
-- Labels are stored on the alert record in PostgreSQL
-- `false_positive` labels count toward pattern suppression (threshold: `SUPPRESSION_LABEL_THRESHOLD`)
-- No automatic threshold adjustment in the PoC — suppression is the only mechanical effect
-- Policy questions (scope, decay, per-operator weighting) remain open for post-PoC experimentation
+The detector waits for the baseline cursor (set by the generator after the baseline phase), then runs in a continuous loop. When there is a backlog of unscored telemetry, it processes ticks back-to-back. When caught up, it sleeps briefly (`DETECTION_IDLE_SLEEP_SECONDS`) before polling again.
 
 ---
 
@@ -328,47 +287,6 @@ updated_at    TIMESTAMPTZ NOT NULL,
 stats         JSONB NOT NULL,   -- per-feature Q1/Q3/IQR/median
 PRIMARY KEY (scope, scope_id, config_type)
 ```
-
-**`alerts`**
-```sql
-alert_id      UUID PRIMARY KEY,
-implant_id    TEXT NOT NULL,
-group_id      TEXT NOT NULL,
-config_type   TEXT NOT NULL,
-timestamp     TIMESTAMPTZ NOT NULL,
-window_start  TIMESTAMPTZ NOT NULL,
-window_end    TIMESTAMPTZ NOT NULL,
-severity      TEXT NOT NULL,
-baseline_used TEXT NOT NULL,
-details       JSONB NOT NULL,
-explanation   TEXT NOT NULL,
-label         TEXT,
-labeled_at    TIMESTAMPTZ
-```
-
-**`suppressed_patterns`**
-```sql
-pattern_hash  TEXT PRIMARY KEY,
-suppressed_at TIMESTAMPTZ NOT NULL,
-label_count   INT NOT NULL DEFAULT 3
-```
-
----
-
-## NOC Dashboard (Streamlit)
-
-### Layout
-
-- **Left panel:** live alert feed, newest first. Each card shows implant ID, group, config type, severity badge, explanation, and three classification buttons (True Positive / False Positive / Expected Deviation). Cards collapse after labelling.
-- **Right panel:** summary metrics — total alerts, label breakdown, false positive rate, detection rate (alerts where `is_anomaly=TRUE` that were flagged).
-- **Bottom:** scrollable raw telemetry view for the selected alert, linked from the alert card.
-
-### Behaviour
-
-- Polls for new alerts every 5 seconds
-- Alert cards animate in as new alerts arrive
-- Labelling an alert immediately updates the card and writes to PostgreSQL
-- Suppressed patterns shown in a collapsed section with a count
 
 ---
 
@@ -407,11 +325,11 @@ window:group:ALPHA:communication_configuration  →  List[JSON feature vector]
 window:implant:0x1337:communication_configuration  →  List[JSON feature vector]
 ```
 
-**Computed baseline** — IQR fences and serialised Isolation Forest model, maintained by the detector. Used for scoring.
+**Computed baseline** — IQR fences and serialised TrainedModel (IsolationForest + StandardScaler + SHAP explainer), maintained by the detector. Used for scoring.
 ```
 model:group:ALPHA:communication_configuration  →  Hash {
     "iqr_fences":            JSON  (per-feature Q1, Q3, IQR, median, lower fence, upper fence),
-    "isolation_forest":      Pickle (trained sklearn IsolationForest),
+    "isolation_forest":      Pickle (TrainedModel dataclass),
     "trained_at":            ISO timestamp,
     "training_sample_size":  int
 }
@@ -420,22 +338,7 @@ model:group:ALPHA:communication_configuration  →  Hash {
 The detector runs in a continuous loop and does two things per tick:
 
 1. **Retrain** (if the window list has grown by more than `RETRAIN_THRESHOLD` new entries since `trained_at`): read the full window list, recompute IQR fences, refit Isolation Forest, write back to the model hash.
-2. **Score**: read the model hash, score unprocessed feature vectors from PostgreSQL against the cached fences and model, pass results to the alert engine.
-
-### Detector → Alert Engine
-
-```python
-@dataclass
-class ScoredEvent:
-    telemetry_row: dict
-    deviating_features: list[FeatureDeviation]
-    isolation_forest_score: float
-    baseline_used: str          # "implant" or "group"
-```
-
-### Alert Engine → Dashboard
-
-Dashboard reads directly from PostgreSQL `alerts` on each poll. No additional interface.
+2. **Score**: read the model hash, score unprocessed feature vectors from PostgreSQL against the cached fences and model, print detections to CLI.
 
 ---
 
@@ -452,19 +355,19 @@ Dashboard reads directly from PostgreSQL `alerts` on each poll. No additional in
 
 ## Open Questions (Post-PoC)
 
-- [ ] **Feedback policy** — scope (implant vs. group vs. global), decay window, minimum labels before suppression
+- [ ] **Alert engine** — deduplication, fatigue mitigation, operator feedback loop
+- [ ] **NOC dashboard** — Streamlit or web UI for alert triage and labeling
 - [ ] **Seasonality modeling** — time-of-day and day-of-week patterns in implant behaviour
 - [ ] **Drift detection** — when do baselines go stale and need forced retraining?
 - [ ] **Multi-model strategy** — specialized models per config type vs. unified model
-- [ ] **Access control** — role separation between NOC operators and model administrators
 - [ ] **Scale** — migrate from PostgreSQL to ClickHouse, single Kafka broker to cluster
 
 ---
 
 ## Success Criteria (PoC)
 
-1. Baseline phase completes and baselines are populated before the live phase starts
-2. Anomalous events in the live phase trigger alerts at a meaningful detection rate
-3. False positive rate on clean events is low enough that the demo is not noisy
-4. Operator labelling in the UI writes back to the database and suppression works
-5. A non-technical observer watching the dashboard understands what is happening
+1. `python run.py` launches the full demo in a tmux session
+2. Baseline phase completes and baselines are populated before the live phase starts
+3. Anomalous events in the live phase produce visible detections in the detector pane
+4. False positive noise is low enough that the CLI output is readable
+5. A non-technical observer watching the detector pane understands what is happening

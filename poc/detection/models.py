@@ -1,28 +1,52 @@
 """
-Detection domain models. Defines the contract between baseline training
-(baseline.py) and scoring (scoring.py) so the interface is explicit rather
-than relying on monkey-patched attributes on third-party sklearn objects.
+Detection domain models. Pure data structures with no heavy dependencies —
+any module can import these without pulling in sklearn or shap.
 """
 
-from dataclasses import dataclass
+import enum
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import TypedDict
 
-import numpy as np
-import shap
-from sklearn.ensemble import IsolationForest
-from sklearn.preprocessing import StandardScaler
+
+class Severity(enum.Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+
+
+class TelemetryRow(TypedDict):
+    id: int
+    implant_id: str
+    group_id: str
+    config_type: str
+    received_at: datetime
+    features: dict[str, float] | str
+    is_anomaly: bool
+    injector_tag: str | None
+    ingested_at: datetime
 
 
 @dataclass
-class TrainedModel:
-    """A trained Isolation Forest with all metadata needed for scoring and explanation."""
-    model: IsolationForest
-    active_features: list[str]
-    scaler: StandardScaler
-    train_score_mean: float
-    train_score_std: float
-    shap_explainer: shap.TreeExplainer
+class ShapContribution:
+    feature_name: str
+    contribution: float  # positive = pushes toward anomalous
 
-    def build_scaled_vector(self, features: dict[str, float]) -> np.ndarray:
-        """Build a feature vector scaled with the training scaler."""
-        raw_vector = np.array([[features.get(name, 0.0) for name in self.active_features]])
-        return self.scaler.transform(raw_vector)
+
+@dataclass
+class FeatureDeviation:
+    feature_name: str
+    observed_value: float
+    expected_median: float
+    lower_fence: float
+    upper_fence: float
+    iqr_deviation: float  # how many IQR units outside the fence
+
+
+@dataclass
+class ScoredEvent:
+    telemetry_row: TelemetryRow
+    deviating_features: list[FeatureDeviation]
+    isolation_forest_score: float
+    baseline_used: str     # "implant" or "group"
+    shap_contributions: list[ShapContribution] = field(default_factory=list)
