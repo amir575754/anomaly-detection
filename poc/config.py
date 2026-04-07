@@ -41,18 +41,21 @@ ISOLATION_FOREST_MEDIUM_THRESHOLD: float = 0.5
 ISOLATION_FOREST_ESTIMATORS: int = 50
 
 # Isolation Forest: expected proportion of anomalies in training data ("auto" for novelty detection)
-ISOLATION_FOREST_CONTAMINATION: str = "auto"
+ISOLATION_FOREST_CONTAMINATION: float | str = "auto"
 
 # Isolation Forest: random seed for reproducible training
 ISOLATION_FOREST_RANDOM_STATE: int = 42
 
 # Minimum feature variance to include a feature in IF training (drops constant/near-constant features)
-FEATURE_VARIANCE_THRESHOLD: float = 0.01
+FEATURE_VARIANCE_THRESHOLD: float = 0.001
 
-# Per-config-type IQR multiplier overrides (types not listed use IQR_MULTIPLIER)
+# Per-config-type IQR multiplier overrides (types not listed use IQR_MULTIPLIER) — do not mutate
 CONFIG_TYPE_IQR_OVERRIDES: dict[str, float] = {
     "dangerous_program_configuration": 1.5,
 }
+
+# Maximum number of SHAP feature contributions included in alert explanations
+SHAP_TOP_N_FEATURES: int = 5
 
 # Sentinel value for IQR deviation when IQR is zero (all baseline values identical)
 ZERO_IQR_DEVIATION_SENTINEL: float = 999.0
@@ -86,7 +89,7 @@ RETRAIN_THRESHOLD: int = 100
 # Detection engine
 # ---------------------------------------------------------------------------
 
-# Config types excluded from anomaly detection
+# Config types excluded from anomaly detection — do not mutate
 DETECTION_EXCLUDED_CONFIG_TYPES: list[str] = []
 
 # Nominal detection batch window in minutes (used for alert window labeling)

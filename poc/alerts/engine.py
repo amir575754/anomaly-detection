@@ -20,7 +20,7 @@ import psycopg2.extensions
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config
-from alerts.models import Alert, FeatureDeviation, Label, ScoredEvent, Severity
+from alerts.models import Alert, FeatureDeviation, Label, ScoredEvent, Severity, ShapContribution
 
 logger = logging.getLogger(__name__)
 
@@ -36,7 +36,7 @@ def determine_severity(
     iqr_has_significant_deviation = (
         len(deviating_features) >= config.IQR_SIGNIFICANT_FEATURE_COUNT
         or any(
-            deviation.iqr_multiplier > config.IQR_SIGNIFICANT_MULTIPLIER
+            deviation.iqr_deviation > config.IQR_SIGNIFICANT_MULTIPLIER
             for deviation in deviating_features
         )
     )
@@ -62,6 +62,7 @@ def generate_explanation(
     group_id: str,
     deviating_features: list[FeatureDeviation],
     severity: Severity,
+    shap_contributions: list[ShapContribution] | None = None,
 ) -> str:
     """Build the human-readable alert explanation shown to NOC operators."""
     parts = [f"Implant {implant_id} (group {group_id}):"]
@@ -71,6 +72,12 @@ def generate_explanation(
             f"(expected {deviation.lower_fence:.4g}\u2013{deviation.upper_fence:.4g}, "
             f"median {deviation.expected_median:.4g})."
         )
+    if shap_contributions and not deviating_features:
+        feature_parts = ", ".join(
+            f"`{contribution.feature_name}` ({contribution.contribution:+.3f})"
+            for contribution in shap_contributions
+        )
+        parts.append(f"Multivariate anomaly \u2014 top contributing features: {feature_parts}.")
     parts.append(f"Severity: {severity.value}.")
     return " ".join(parts)
 
@@ -144,11 +151,18 @@ def persist_alert(
                 "expected_median": deviation.expected_median,
                 "lower_fence": deviation.lower_fence,
                 "upper_fence": deviation.upper_fence,
-                "iqr_multiplier": deviation.iqr_multiplier,
+                "iqr_deviation": deviation.iqr_deviation,
             }
             for deviation in alert.deviating_features
         ],
         "isolation_forest_score": alert.isolation_forest_score,
+        "shap_contributions": [
+            {
+                "feature_name": contribution.feature_name,
+                "contribution": contribution.contribution,
+            }
+            for contribution in alert.shap_contributions
+        ],
     }
 
     with db_connection:
@@ -222,8 +236,9 @@ def build_alert(
         isolation_forest_score=event.isolation_forest_score,
         explanation=generate_explanation(
             row["implant_id"], row["group_id"], event.deviating_features, severity,
+            shap_contributions=event.shap_contributions,
         ),
-        label=None,
+        shap_contributions=event.shap_contributions,
     )
 
 
@@ -261,7 +276,7 @@ def process_scored_events(
 
         alert = build_alert(event, severity, window_start, window_end)
         persist_alert(db_connection, alert, pattern_hash)
-        recent_hashes.add(pattern_hash)
+        recent_hashes.add(pattern_hash)  # keep within-batch deduplication current
         alert_count_by_implant[row["implant_id"]] += 1
         logger.info(
             "ALERT CREATED: %s [%s] implant=%s config=%s IF=%.3f",

@@ -18,11 +18,14 @@ from datetime import datetime, timezone
 import numpy as np
 import psycopg2.extensions
 import redis as redis_module
+import shap
 from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config
+import config  # noqa: E402 — path setup required before import
+from detection.models import TrainedModel
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +35,27 @@ def compute_single_feature_fence(
     feature_name: str,
     iqr_multiplier: float | None = None,
 ) -> dict:
-    """Compute Q1, Q3, IQR, median, and fences for one feature."""
+    """Compute Q1, Q3, IQR, median, and fences for one feature.
+
+    Fences are clamped using robust percentile bounds (P1/P99) so they never
+    extend beyond the bulk of the training distribution.  This prevents
+    features with narrow ranges (e.g. jitter_percentage 0.10-0.25) from
+    getting fences that reach into impossible territory (e.g. -0.035),
+    while remaining resistant to outlier contamination in the sliding window.
+    """
     multiplier = iqr_multiplier if iqr_multiplier is not None else config.IQR_MULTIPLIER
     values = np.array([vector.get(feature_name, 0.0) for vector in feature_vectors])
-    q1, median_value, q3 = np.percentile(values, [25, 50, 75])
+    p1, q1, median_value, q3, p99 = np.percentile(values, [1, 25, 50, 75, 99])
     iqr = float(q3 - q1)
+    raw_lower = float(q1) - multiplier * iqr
+    raw_upper = float(q3) + multiplier * iqr
     return {
         "Q1": float(q1),
         "Q3": float(q3),
         "IQR": iqr,
         "median": float(median_value),
-        "lower_fence": float(q1) - multiplier * iqr,
-        "upper_fence": float(q3) + multiplier * iqr,
+        "lower_fence": max(raw_lower, float(p1)),
+        "upper_fence": min(raw_upper, float(p99)),
     }
 
 
@@ -92,15 +104,8 @@ def filter_low_variance_features(
     return active
 
 
-def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> IsolationForest:
-    """
-    Fit and return an IsolationForest on the full feature matrix.
-
-    Stores on the model:
-    - feature_column_order: all feature names (alphabetical)
-    - active_features: features that passed variance filtering (used for scoring)
-    - train_score_mean / train_score_std: calibration stats for z-score normalization
-    """
+def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> TrainedModel:
+    """Fit an Isolation Forest and return a TrainedModel with all scoring metadata."""
     if not feature_vectors:
         raise ValueError("Cannot train IsolationForest on zero samples")
 
@@ -111,9 +116,12 @@ def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> Isolation
         logger.warning("All features dropped by variance filter — using all features")
         active_features = all_feature_names
 
-    matrix = np.array(
+    raw_matrix = np.array(
         [[vector.get(name, 0.0) for name in active_features] for vector in feature_vectors]
     )
+    scaler = StandardScaler()
+    matrix = scaler.fit_transform(raw_matrix)
+
     logger.debug(
         "Training IsolationForest: %d samples x %d features, "
         "n_estimators=%d, contamination=%s",
@@ -129,17 +137,22 @@ def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> Isolation
     model.fit(matrix)
 
     train_scores = model.decision_function(matrix)
-    model.feature_column_order = all_feature_names  # type: ignore[attr-defined]
-    model.active_features = active_features  # type: ignore[attr-defined]
-    model.train_score_mean = float(np.mean(train_scores))  # type: ignore[attr-defined]
-    model.train_score_std = float(np.std(train_scores))  # type: ignore[attr-defined]
+    train_score_mean = float(np.mean(train_scores))
+    train_score_std = float(np.std(train_scores))
 
     logger.debug(
         "IsolationForest trained: active_features=%d, "
         "train_score_mean=%.4f, train_score_std=%.4f",
-        len(active_features), model.train_score_mean, model.train_score_std,  # type: ignore[attr-defined]
+        len(active_features), train_score_mean, train_score_std,
     )
-    return model
+    return TrainedModel(
+        model=model,
+        active_features=active_features,
+        scaler=scaler,
+        train_score_mean=train_score_mean,
+        train_score_std=train_score_std,
+        shap_explainer=shap.TreeExplainer(model),
+    )
 
 
 def read_window_vectors(
@@ -169,16 +182,16 @@ def save_model_to_redis(
     scope_id: str,
     config_type: str,
     fences: dict,
-    model: IsolationForest,
+    trained_model: TrainedModel,
     sample_count: int,
 ) -> None:
-    """Serialize and cache fences + model to the Redis model hash."""
+    """Serialize and cache fences + trained model to the Redis model hash."""
     model_key = f"model:{scope}:{scope_id}:{config_type}"
     writes_key = f"writes:{scope}:{scope_id}:{config_type}"
     current_writes: bytes | None = redis_connection.get(writes_key)  # type: ignore[assignment]
     redis_connection.hset(model_key, mapping={
         "iqr_fences": json.dumps(fences),
-        "isolation_forest": pickle.dumps(model),  # noqa: S301 — internal Redis, see module docstring
+        "isolation_forest": pickle.dumps(trained_model),  # noqa: S301 — internal Redis, see module docstring
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "training_sample_size": str(sample_count),
         "trained_at_writes": str(current_writes.decode() if current_writes else 0),
@@ -246,11 +259,11 @@ def refresh_baseline(
 
     feature_vectors = slice_window_for_scope(feature_vectors, scope)
     fences = compute_iqr_fences(feature_vectors, config_type)
-    model = train_isolation_forest(feature_vectors)
+    trained_model = train_isolation_forest(feature_vectors)
 
     save_model_to_redis(
         redis_connection, scope, scope_id, config_type,
-        fences, model, len(feature_vectors),
+        fences, trained_model, len(feature_vectors),
     )
     persist_baseline_to_postgresql(db_connection, scope, scope_id, config_type, fences)
     logger.info("Refreshed %s:%s:%s (%d samples)", scope, scope_id, config_type, len(feature_vectors))
@@ -263,7 +276,7 @@ def load_model_from_redis(
     config_type: str,
 ) -> dict | None:
     """
-    Load cached IQR fences and IsolationForest from Redis.
+    Load cached IQR fences and TrainedModel from Redis.
     Returns None if the model has not been trained yet.
     """
     model_key = f"model:{scope}:{scope_id}:{config_type}"
@@ -272,10 +285,11 @@ def load_model_from_redis(
         logger.debug("No cached model found for %s", model_key)
         return None
 
+    trained_model: TrainedModel = pickle.loads(raw_hash[b"isolation_forest"])  # noqa: S301 — internal Redis, see module docstring
     logger.debug("Loaded model from Redis: %s", model_key)
     return {
         "iqr_fences": json.loads(raw_hash[b"iqr_fences"]),
-        "isolation_forest": pickle.loads(raw_hash[b"isolation_forest"]),  # noqa: S301 — internal Redis, see module docstring
+        "trained_model": trained_model,
     }
 
 

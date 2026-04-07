@@ -22,28 +22,27 @@ import redis as redis_module
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import config
+import config  # noqa: E402 — path setup required before import
 from alerts.engine import process_scored_events
 from alerts.models import ScoredEvent
 from detection.baseline import load_model_from_redis, refresh_baseline, should_retrain
-from detection.scoring import score_with_iqr, score_with_isolation_forest
+from detection.keys import parse_window_key
+from detection.scoring import score_with_iqr, score_with_isolation_forest, explain_isolation_forest
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 def discover_window_keys(redis_connection: redis_module.Redis) -> list[tuple[str, str, str]]:
     """Return all (scope, scope_id, config_type) tuples that have window data."""
     results = []
     for raw_key in redis_connection.scan_iter(match="window:*"):
-        parts = raw_key.decode("utf-8").split(":", 3)
-        if len(parts) == 4:
-            _, scope, scope_id, config_type = parts
-            results.append((scope, scope_id, config_type))
+        parsed = parse_window_key(raw_key)
+        if parsed is not None:
+            results.append(parsed)
     logger.debug("Discovered %d window keys in Redis", len(results))
     return results
 
@@ -211,14 +210,18 @@ def score_row_with_cache(
         return None
 
     deviations = score_with_iqr(features, cached_model["iqr_fences"])
-    isolation_forest_score = score_with_isolation_forest(
-        features, cached_model["isolation_forest"]
-    )
+    trained_model = cached_model["trained_model"]
+    isolation_forest_score = score_with_isolation_forest(features, trained_model)
 
-    if deviations:
+    shap_contributions = []
+    if isolation_forest_score >= config.ISOLATION_FOREST_MEDIUM_THRESHOLD:
+        shap_contributions = explain_isolation_forest(features, trained_model)
+
+    if deviations or shap_contributions:
         logger.debug(
-            "Telemetry id=%s implant=%s: %d IQR deviations, IF score=%.3f",
+            "Telemetry id=%s implant=%s: %d IQR deviations, IF score=%.3f, %d SHAP features",
             row.get("id"), implant_id, len(deviations), isolation_forest_score,
+            len(shap_contributions),
         )
 
     return ScoredEvent(
@@ -226,6 +229,7 @@ def score_row_with_cache(
         deviating_features=deviations,
         isolation_forest_score=isolation_forest_score,
         baseline_used=scope,
+        shap_contributions=shap_contributions,
     )
 
 
