@@ -32,7 +32,8 @@ class DetectionSummary:
         self.config_type_counts[row["config_type"]] += 1
         injector_tag = row.get("injector_tag")
         if injector_tag and row.get("is_anomaly"):
-            self.injector_counts[injector_tag] += 1
+            normalized = injector_tag.split(":")[0] if ":" in injector_tag else injector_tag
+            self.injector_counts[normalized] += 1
 
     def record_suppressed(self) -> None:
         self.total_suppressed += 1

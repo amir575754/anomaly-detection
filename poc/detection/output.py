@@ -71,7 +71,9 @@ def _build_panel(event: ScoredEvent, severity: Severity) -> Panel:
         f"{row['implant_id']} ({row['group_id']}) {row['config_type']}"
     )
 
-    body = Text()
+    injector_tag = row.get("injector_tag") if row.get("is_anomaly") else None
+    subtitle = f"[bold green]TP: {injector_tag}[/bold green]" if injector_tag else None
+
     iqr_table = _build_iqr_table(event)
     shap_table = _build_shap_table(event)
 
@@ -87,7 +89,7 @@ def _build_panel(event: ScoredEvent, severity: Severity) -> Panel:
     parts.append(Text(f"IF Score: {event.isolation_forest_score:.3f}", style="bold"))
     panel_body = Group(*parts)
 
-    return Panel(panel_body, title=title, border_style=color, expand=False)
+    return Panel(panel_body, title=title, subtitle=subtitle, border_style=color, expand=False)
 
 
 def print_detections(scored_events: list[ScoredEvent]) -> int:
