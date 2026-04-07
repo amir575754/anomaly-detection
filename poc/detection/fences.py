@@ -19,14 +19,15 @@ import config  # noqa: E402 — path setup required before import
 logger = logging.getLogger(__name__)
 
 
-def clamp_fences(
-    raw_lower: float,
-    raw_upper: float,
-    p1: float,
-    p99: float,
-) -> tuple[float, float]:
-    """Clamp IQR fences to robust percentile bounds (P1/P99)."""
-    return max(raw_lower, p1), min(raw_upper, p99)
+def clamp_lower_fence(raw_lower: float, p1: float) -> float:
+    """Clamp the lower fence at P1 so it never extends below the training distribution.
+
+    Only the lower fence is clamped — this prevents fences from reaching into
+    impossible territory for narrow-range features (e.g. jitter_percentage).
+    The upper fence uses the raw IQR calculation to avoid guaranteed false
+    positives on the top percentile of normal values.
+    """
+    return max(raw_lower, p1)
 
 
 def compute_single_feature_fence(
@@ -36,26 +37,22 @@ def compute_single_feature_fence(
 ) -> dict:
     """Compute Q1, Q3, IQR, median, and fences for one feature.
 
-    Fences are clamped using robust percentile bounds (P1/P99) so they never
-    extend beyond the bulk of the training distribution.  This prevents
-    features with narrow ranges (e.g. jitter_percentage 0.10-0.25) from
-    getting fences that reach into impossible territory (e.g. -0.035),
-    while remaining resistant to outlier contamination in the sliding window.
+    The lower fence is clamped at P1 so it never extends below the bulk of
+    the training distribution — this prevents narrow-range features (e.g.
+    jitter_percentage 0.10-0.25) from getting fences in impossible territory.
     """
     multiplier = iqr_multiplier if iqr_multiplier is not None else config.IQR_MULTIPLIER
     values = np.array([vector.get(feature_name, 0.0) for vector in feature_vectors])
-    p1, q1, median_value, q3, p99 = np.percentile(values, [1, 25, 50, 75, 99])
+    p1, q1, median_value, q3 = np.percentile(values, [1, 25, 50, 75])
     iqr = float(q3 - q1)
     raw_lower = float(q1) - multiplier * iqr
-    raw_upper = float(q3) + multiplier * iqr
-    lower_fence, upper_fence = clamp_fences(raw_lower, raw_upper, float(p1), float(p99))
     return {
         "Q1": float(q1),
         "Q3": float(q3),
         "IQR": iqr,
         "median": float(median_value),
-        "lower_fence": lower_fence,
-        "upper_fence": upper_fence,
+        "lower_fence": clamp_lower_fence(raw_lower, float(p1)),
+        "upper_fence": float(q3) + multiplier * iqr,
     }
 
 

@@ -119,7 +119,9 @@ def determine_severity(
     if_high, if_medium = classify_isolation_forest_signals(isolation_forest_score)
     if iqr_significant and if_high:
         return Severity.HIGH
-    if iqr_any or if_medium:
+    if iqr_significant:
+        return Severity.MEDIUM
+    if iqr_any and (if_medium or if_high):
         return Severity.MEDIUM
     if if_high and not iqr_any:
         return Severity.LOW
