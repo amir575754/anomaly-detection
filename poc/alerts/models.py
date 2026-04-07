@@ -1,5 +1,5 @@
 import enum
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import TypedDict
 
@@ -29,13 +29,19 @@ class TelemetryRow(TypedDict):
 
 
 @dataclass
+class ShapContribution:
+    feature_name: str
+    contribution: float  # positive = pushes toward anomalous
+
+
+@dataclass
 class FeatureDeviation:
     feature_name: str
     observed_value: float
     expected_median: float
     lower_fence: float
     upper_fence: float
-    iqr_multiplier: float  # how many IQR units outside the fence
+    iqr_deviation: float  # how many IQR units outside the fence
 
 
 @dataclass
@@ -52,6 +58,7 @@ class Alert:
     deviating_features: list[FeatureDeviation]
     isolation_forest_score: float
     explanation: str
+    shap_contributions: list[ShapContribution] = field(default_factory=list)
     label: Label | None = None
 
 
@@ -61,3 +68,4 @@ class ScoredEvent:
     deviating_features: list[FeatureDeviation]
     isolation_forest_score: float
     baseline_used: str     # "implant" or "group"
+    shap_contributions: list[ShapContribution] = field(default_factory=list)

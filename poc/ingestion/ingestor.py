@@ -27,7 +27,6 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 def flush_batch(
@@ -61,12 +60,12 @@ def make_consumer() -> Consumer:
     return consumer
 
 
-def flush_if_needed(
+def flush_and_clear_batch(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
     batch: list[dict],
 ) -> int:
-    """Flush the batch if non-empty; return number of messages flushed."""
+    """Flush the batch to storage and clear it. Returns number of messages flushed."""
     if not batch:
         return 0
     flush_batch(db_connection, redis_connection, batch)
@@ -126,7 +125,7 @@ def consume_loop(
                     "Idle flush: %d messages pending (below batch size %d)",
                     len(batch), config.INGESTOR_BATCH_SIZE,
                 )
-            processed += flush_if_needed(db_connection, redis_connection, batch)
+            processed += flush_and_clear_batch(db_connection, redis_connection, batch)
 
         if processed - last_logged_at_count >= config.INGESTOR_LOG_INTERVAL_MESSAGES:
             logger.info("Processed %d messages total", processed)
@@ -159,6 +158,7 @@ def run() -> None:
     finally:
         consumer.close()
         db_connection.close()
+        redis_connection.close()
 
 
 if __name__ == "__main__":

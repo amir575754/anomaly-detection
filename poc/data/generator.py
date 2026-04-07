@@ -24,13 +24,13 @@ import config
 from data.anomalies import inject_random_anomaly
 from data.profiles import generate_snapshot, sample_config_type
 from detection.baseline import refresh_baseline
+from detection.keys import parse_window_key
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 _MINUTES_PER_SNAPSHOT: int = (24 * 60) // config.SNAPSHOTS_PER_IMPLANT_PER_DAY
 
@@ -169,27 +169,22 @@ def wait_for_ingestor(expected_count: int, timeout_seconds: int | None = None) -
         db_connection.close()
 
 
-def parse_window_key(raw_key: bytes) -> tuple[str, str, str] | None:
-    """Parse a Redis window key into (scope, scope_id, config_type) or None."""
-    parts = raw_key.decode("utf-8").split(":", 3)
-    if len(parts) == 4:
-        return parts[1], parts[2], parts[3]
-    return None
-
-
 def save_baseline_cursor() -> None:
     """Store the current max telemetry ID so the detector knows where live data starts."""
     db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
-    with db_connection.cursor() as cursor:
-        cursor.execute("SELECT COALESCE(MAX(id), 0) FROM telemetry")
-        row = cursor.fetchone()
-        max_id = row[0] if row else 0
-    redis_connection.set("detector:baseline_cursor", str(max_id))
-    logger.info("Saved baseline cursor to Redis: telemetry id %d", max_id)
-    db_connection.close()
+    try:
+        with db_connection.cursor() as cursor:
+            cursor.execute("SELECT COALESCE(MAX(id), 0) FROM telemetry")
+            row = cursor.fetchone()
+            max_id = row[0] if row else 0
+        redis_connection.set("detector:baseline_cursor", str(max_id))
+        logger.info("Saved baseline cursor to Redis: telemetry id %d", max_id)
+    finally:
+        db_connection.close()
+        redis_connection.close()
 
 
 def bootstrap_baselines() -> None:
@@ -200,32 +195,35 @@ def bootstrap_baselines() -> None:
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False
     )
 
-    raw_keys = list(redis_connection.scan_iter(match="window:*"))
-    logger.info("Bootstrapping baselines for %d window keys", len(raw_keys))
+    try:
+        raw_keys = list(redis_connection.scan_iter(match="window:*"))
+        logger.info("Bootstrapping baselines for %d window keys", len(raw_keys))
 
-    succeeded = 0
-    failed = 0
-    for raw_key in raw_keys:
-        parsed = parse_window_key(raw_key)
-        if parsed is None:
-            logger.warning("Unparseable window key: %r", raw_key)
-            continue
-        scope, scope_id, config_type = parsed
-        try:
-            refresh_baseline(redis_connection, db_connection, scope, scope_id, config_type)
-            succeeded += 1
-        except Exception:
-            failed += 1
-            logger.error(
-                "Bootstrap failed for %s:%s:%s", scope, scope_id, config_type,
-                exc_info=True,
-            )
+        succeeded = 0
+        failed = 0
+        for raw_key in raw_keys:
+            parsed = parse_window_key(raw_key)
+            if parsed is None:
+                logger.warning("Unparseable window key: %r", raw_key)
+                continue
+            scope, scope_id, config_type = parsed
+            try:
+                refresh_baseline(redis_connection, db_connection, scope, scope_id, config_type)
+                succeeded += 1
+            except Exception:
+                failed += 1
+                logger.error(
+                    "Bootstrap failed for %s:%s:%s", scope, scope_id, config_type,
+                    exc_info=True,
+                )
 
-    db_connection.close()
-    logger.info(
-        "Baseline bootstrap complete: %d succeeded, %d failed out of %d keys",
-        succeeded, failed, len(raw_keys),
-    )
+        logger.info(
+            "Baseline bootstrap complete: %d succeeded, %d failed out of %d keys",
+            succeeded, failed, len(raw_keys),
+        )
+    finally:
+        db_connection.close()
+        redis_connection.close()
 
 
 def enforce_rate_limit(
