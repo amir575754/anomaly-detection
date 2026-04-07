@@ -14,6 +14,36 @@ import config
 logger = logging.getLogger(__name__)
 
 
+def upsert_implants(cursor, implant_rows: list) -> None:
+    """Upsert implant rows, merging first_seen and last_seen timestamps."""
+    psycopg2.extras.execute_values(
+        cursor,
+        """
+        INSERT INTO implants (implant_id, group_id, first_seen, last_seen, status)
+        VALUES %s
+        ON CONFLICT (implant_id)
+        DO UPDATE SET
+            first_seen = LEAST(implants.first_seen, EXCLUDED.first_seen),
+            last_seen = GREATEST(implants.last_seen, EXCLUDED.last_seen)
+        """,
+        implant_rows,
+        template="(%s, %s, %s, %s, 'active')",
+    )
+
+
+def insert_telemetry(cursor, telemetry_rows: list) -> None:
+    """Bulk-insert telemetry rows."""
+    psycopg2.extras.execute_values(
+        cursor,
+        """
+        INSERT INTO telemetry
+            (implant_id, config_type, received_at, raw, features, is_anomaly, injector_tag)
+        VALUES %s
+        """,
+        telemetry_rows,
+    )
+
+
 def write_to_postgresql(
     db_connection: psycopg2.extensions.connection,
     implant_rows: list,
@@ -26,28 +56,8 @@ def write_to_postgresql(
     )
     with db_connection:
         with db_connection.cursor() as cursor:
-            psycopg2.extras.execute_values(
-                cursor,
-                """
-                INSERT INTO implants (implant_id, group_id, first_seen, last_seen, status)
-                VALUES %s
-                ON CONFLICT (implant_id)
-                DO UPDATE SET
-                    first_seen = LEAST(implants.first_seen, EXCLUDED.first_seen),
-                    last_seen = GREATEST(implants.last_seen, EXCLUDED.last_seen)
-                """,
-                implant_rows,
-                template="(%s, %s, %s, %s, 'active')",
-            )
-            psycopg2.extras.execute_values(
-                cursor,
-                """
-                INSERT INTO telemetry
-                    (implant_id, config_type, received_at, raw, features, is_anomaly, injector_tag)
-                VALUES %s
-                """,
-                telemetry_rows,
-            )
+            upsert_implants(cursor, implant_rows)
+            insert_telemetry(cursor, telemetry_rows)
     logger.debug("PostgreSQL write complete")
 
 

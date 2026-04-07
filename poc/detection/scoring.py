@@ -88,6 +88,25 @@ def explain_isolation_forest(
     return contributions[:config.SHAP_TOP_N_FEATURES]
 
 
+def classify_iqr_signals(
+    deviating_features: list[FeatureDeviation],
+) -> tuple[bool, bool]:
+    """Return (has_significant_deviation, has_any_deviation) from IQR results."""
+    has_any = len(deviating_features) >= 1
+    has_significant = (
+        len(deviating_features) >= config.IQR_SIGNIFICANT_FEATURE_COUNT
+        or any(d.iqr_deviation > config.IQR_SIGNIFICANT_MULTIPLIER for d in deviating_features)
+    )
+    return has_significant, has_any
+
+
+def classify_isolation_forest_signals(score: float) -> tuple[bool, bool]:
+    """Return (is_high, is_medium) from the Isolation Forest score."""
+    is_high = score > config.ISOLATION_FOREST_HIGH_THRESHOLD
+    is_medium = config.ISOLATION_FOREST_MEDIUM_THRESHOLD <= score <= config.ISOLATION_FOREST_HIGH_THRESHOLD
+    return is_high, is_medium
+
+
 def determine_severity(
     deviating_features: list[FeatureDeviation],
     isolation_forest_score: float,
@@ -96,25 +115,12 @@ def determine_severity(
     Determine detection severity from IQR deviations and IF score.
     Returns None if neither model finds anything worth reporting.
     """
-    iqr_has_significant_deviation = (
-        len(deviating_features) >= config.IQR_SIGNIFICANT_FEATURE_COUNT
-        or any(
-            deviation.iqr_deviation > config.IQR_SIGNIFICANT_MULTIPLIER
-            for deviation in deviating_features
-        )
-    )
-    iqr_has_any_deviation = len(deviating_features) >= 1
-    isolation_forest_is_high = isolation_forest_score > config.ISOLATION_FOREST_HIGH_THRESHOLD
-    isolation_forest_is_medium = (
-        config.ISOLATION_FOREST_MEDIUM_THRESHOLD
-        <= isolation_forest_score
-        <= config.ISOLATION_FOREST_HIGH_THRESHOLD
-    )
-
-    if iqr_has_significant_deviation and isolation_forest_is_high:
+    iqr_significant, iqr_any = classify_iqr_signals(deviating_features)
+    if_high, if_medium = classify_isolation_forest_signals(isolation_forest_score)
+    if iqr_significant and if_high:
         return Severity.HIGH
-    if iqr_has_any_deviation or isolation_forest_is_medium:
+    if iqr_any or if_medium:
         return Severity.MEDIUM
-    if isolation_forest_is_high and not iqr_has_any_deviation:
+    if if_high and not iqr_any:
         return Severity.LOW
     return None

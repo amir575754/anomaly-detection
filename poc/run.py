@@ -78,48 +78,45 @@ def shell_command(module: str) -> str:
     return f"source {_QUOTED_VENV_ACTIVATE} && cd {_QUOTED_POC_DIR} && python -m {module}"
 
 
-def launch_tmux() -> None:
-    """Create a tmux session with three panes and attach."""
-    kill_existing_session()
-
+def create_tmux_panes() -> None:
+    """Create the tmux session with three panes for ingestor, detector, and generator."""
     ingestor_command = shell_command("ingestion.ingestor")
     detector_command = shell_command("detection.detector")
     generator_command = shell_command("data.generator")
-
-    # Create session with the ingestor in the first pane
     run_command(
         f"tmux new-session -d -s {SESSION_NAME} -n demo "
         f"'{ingestor_command}; read -p \"[ingestor exited] press enter to close\"'"
     )
-
-    # Split right for the detector
     run_command(
         f"tmux split-window -h -t {SESSION_NAME}:demo "
         f"'{detector_command}; read -p \"[detector exited] press enter to close\"'"
     )
-
-    # Split bottom for the generator
     run_command(
         f"tmux split-window -v -t {SESSION_NAME}:demo.0 -l 30% "
         f"'{generator_command}; read -p \"[generator exited] press enter to close\"'"
     )
 
-    # Add pane labels via border titles
+
+def configure_tmux_labels() -> None:
+    """Set pane titles and border formatting for the tmux session."""
     run_command(f"tmux select-pane -t {SESSION_NAME}:demo.0 -T 'INGESTOR'")
     run_command(f"tmux select-pane -t {SESSION_NAME}:demo.1 -T 'DETECTOR'")
     run_command(f"tmux select-pane -t {SESSION_NAME}:demo.2 -T 'GENERATOR'")
     run_command(f"tmux set-option -t {SESSION_NAME} pane-border-status top")
     run_command(f"tmux set-option -t {SESSION_NAME} pane-border-format ' #{{pane_title}} '")
-
-    # Focus on the detector pane (where anomaly output appears)
     run_command(f"tmux select-pane -t {SESSION_NAME}:demo.1")
 
+
+def launch_tmux() -> None:
+    """Create a tmux session with three panes and attach."""
+    kill_existing_session()
+    create_tmux_panes()
+    configure_tmux_labels()
     print(f"\nAttaching to tmux session '{SESSION_NAME}'...")
     print("  Pane layout: INGESTOR (top-left) | DETECTOR (right) | GENERATOR (bottom-left)")
     print(f"  To detach: Ctrl+B, then D")
     print(f"  To stop: tmux kill-session -t {SESSION_NAME}")
     print()
-
     os.execvp("tmux", ["tmux", "attach-session", "-t", SESSION_NAME])
 
 

@@ -94,6 +94,19 @@ def extract_payload(message) -> dict | None:
     return json.loads(message.value().decode("utf-8"))
 
 
+def should_flush_batch(payload, batch: list[dict]) -> bool:
+    """Return True if the batch should be flushed to storage."""
+    if len(batch) >= config.INGESTOR_BATCH_SIZE:
+        return True
+    if payload is None and batch:
+        logger.debug(
+            "Idle flush: %d messages pending (below batch size %d)",
+            len(batch), config.INGESTOR_BATCH_SIZE,
+        )
+        return True
+    return False
+
+
 def consume_loop(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
@@ -103,26 +116,12 @@ def consume_loop(
     processed = 0
     last_logged_at_count = 0
     batch: list[dict] = []
-
     while True:
-        payload = extract_payload(
-            consumer.poll(timeout=config.KAFKA_POLL_TIMEOUT_SECONDS)
-        )
-
+        payload = extract_payload(consumer.poll(timeout=config.KAFKA_POLL_TIMEOUT_SECONDS))
         if payload is not None:
             batch.append(payload)
-
-        batch_is_full = len(batch) >= config.INGESTOR_BATCH_SIZE
-        idle_with_pending_data = payload is None and batch
-
-        if batch_is_full or idle_with_pending_data:
-            if idle_with_pending_data:
-                logger.debug(
-                    "Idle flush: %d messages pending (below batch size %d)",
-                    len(batch), config.INGESTOR_BATCH_SIZE,
-                )
+        if should_flush_batch(payload, batch):
             processed += flush_and_clear_batch(db_connection, redis_connection, batch)
-
         if processed - last_logged_at_count >= config.INGESTOR_LOG_INTERVAL_MESSAGES:
             logger.info("Processed %d messages total", processed)
             last_logged_at_count = processed
