@@ -85,6 +85,16 @@ def generate_baseline_snapshot(
     return snapshot
 
 
+def generate_baseline_event_times(now: datetime) -> list[datetime]:
+    """Return all event timestamps for the baseline period."""
+    times = []
+    for day_offset in range(config.BASELINE_DAYS):
+        day_start = now - timedelta(days=config.BASELINE_DAYS - day_offset)
+        for snapshot_index in range(config.SNAPSHOTS_PER_IMPLANT_PER_DAY):
+            times.append(day_start + timedelta(minutes=snapshot_index * _MINUTES_PER_SNAPSHOT))
+    return times
+
+
 def publish_implant_baseline(
     producer: Producer,
     implant_id: str,
@@ -96,16 +106,10 @@ def publish_implant_baseline(
         "Generating baseline for implant %s (group %s): %d days x %d snapshots/day",
         implant_id, group_id, config.BASELINE_DAYS, config.SNAPSHOTS_PER_IMPLANT_PER_DAY,
     )
-    published = 0
-    for day_offset in range(config.BASELINE_DAYS):
-        day_start = now - timedelta(days=config.BASELINE_DAYS - day_offset)
-        for snapshot_index in range(config.SNAPSHOTS_PER_IMPLANT_PER_DAY):
-            event_time = day_start + timedelta(
-                minutes=snapshot_index * _MINUTES_PER_SNAPSHOT
-            )
-            publish(producer, generate_baseline_snapshot(implant_id, group_id, event_time))
-            published += 1
-    return published
+    event_times = generate_baseline_event_times(now)
+    for event_time in event_times:
+        publish(producer, generate_baseline_snapshot(implant_id, group_id, event_time))
+    return len(event_times)
 
 
 def run_baseline_phase(producer: Producer, implants: list[tuple[str, str]]) -> int:
@@ -136,34 +140,40 @@ def poll_telemetry_count(db_connection: psycopg2.extensions.connection) -> int:
         return row[0] if row else 0
 
 
+def poll_until_caught_up(
+    db_connection: psycopg2.extensions.connection,
+    expected_count: int,
+    target: int,
+    deadline: float,
+) -> None:
+    """Poll telemetry count until target is reached or deadline expires."""
+    last_logged_at = 0.0
+    while time.time() < deadline:
+        current_count = poll_telemetry_count(db_connection)
+        if current_count >= target:
+            logger.info("Ingestor caught up — %d rows", current_count)
+            return
+        now = time.time()
+        if now - last_logged_at >= config.INGESTOR_LOG_INTERVAL_SECONDS:
+            logger.info(
+                "Ingestor progress: %d / %d (%.1f%%)",
+                current_count, expected_count,
+                100 * current_count / expected_count if expected_count > 0 else 0.0,
+            )
+            last_logged_at = now
+        time.sleep(config.INGESTOR_POLL_INTERVAL_SECONDS)
+    raise TimeoutError(f"Ingestor did not finish within deadline")
+
+
 def wait_for_ingestor(expected_count: int, timeout_seconds: int | None = None) -> None:
     """Block until PostgreSQL telemetry row count reaches expected_count."""
     if timeout_seconds is None:
         timeout_seconds = config.INGESTOR_WAIT_TIMEOUT_SECONDS
     db_connection = psycopg2.connect(config.DATABASE_DSN)
-    deadline = time.time() + timeout_seconds
-    last_logged_at = 0.0
     target = int(expected_count * config.INGESTOR_COMPLETION_THRESHOLD)
-
     logger.info("Waiting for ingestor to process %d baseline events...", expected_count)
-
     try:
-        while time.time() < deadline:
-            current_count = poll_telemetry_count(db_connection)
-            if current_count >= target:
-                logger.info("Ingestor caught up — %d rows", current_count)
-                return
-            now = time.time()
-            if now - last_logged_at >= config.INGESTOR_LOG_INTERVAL_SECONDS:
-                logger.info(
-                    "Ingestor progress: %d / %d (%.1f%%)",
-                    current_count, expected_count,
-                    100 * current_count / expected_count if expected_count > 0 else 0.0,
-                )
-                last_logged_at = now
-            time.sleep(config.INGESTOR_POLL_INTERVAL_SECONDS)
-
-        raise TimeoutError(f"Ingestor did not finish within {timeout_seconds}s")
+        poll_until_caught_up(db_connection, expected_count, target, time.time() + timeout_seconds)
     finally:
         db_connection.close()
 
@@ -186,6 +196,25 @@ def save_baseline_cursor() -> None:
         redis_connection.close()
 
 
+def try_refresh_single_baseline(
+    redis_connection: redis_module.Redis,
+    db_connection: psycopg2.extensions.connection,
+    raw_key: bytes,
+) -> bool:
+    """Attempt to refresh a single baseline from a window key. Returns True on success."""
+    parsed = parse_window_key(raw_key)
+    if parsed is None:
+        logger.warning("Unparseable window key: %r", raw_key)
+        return False
+    scope, scope_id, config_type = parsed
+    try:
+        refresh_baseline(redis_connection, db_connection, scope, scope_id, config_type)
+        return True
+    except Exception:
+        logger.error("Bootstrap failed for %s:%s:%s", scope, scope_id, config_type, exc_info=True)
+        return False
+
+
 def bootstrap_baselines() -> None:
     """Refresh baselines for all window keys populated during ingestion."""
     logger.info("Connecting to PostgreSQL and Redis for baseline bootstrap")
@@ -193,32 +222,14 @@ def bootstrap_baselines() -> None:
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False
     )
-
     try:
         raw_keys = list(redis_connection.scan_iter(match="window:*"))
         logger.info("Bootstrapping baselines for %d window keys", len(raw_keys))
-
-        succeeded = 0
-        failed = 0
-        for raw_key in raw_keys:
-            parsed = parse_window_key(raw_key)
-            if parsed is None:
-                logger.warning("Unparseable window key: %r", raw_key)
-                continue
-            scope, scope_id, config_type = parsed
-            try:
-                refresh_baseline(redis_connection, db_connection, scope, scope_id, config_type)
-                succeeded += 1
-            except Exception:
-                failed += 1
-                logger.error(
-                    "Bootstrap failed for %s:%s:%s", scope, scope_id, config_type,
-                    exc_info=True,
-                )
-
+        results = [try_refresh_single_baseline(redis_connection, db_connection, k) for k in raw_keys]
+        succeeded = sum(results)
         logger.info(
             "Baseline bootstrap complete: %d succeeded, %d failed out of %d keys",
-            succeeded, failed, len(raw_keys),
+            succeeded, len(results) - succeeded, len(raw_keys),
         )
     finally:
         db_connection.close()
@@ -262,6 +273,28 @@ def has_reached_event_cap(total_published: int) -> bool:
     return config.LIVE_PHASE_MAX_EVENTS > 0 and total_published >= config.LIVE_PHASE_MAX_EVENTS
 
 
+def publish_single_live_event(
+    producer: Producer,
+    implant_id: str,
+    group_id: str,
+    total_published: int,
+    total_anomalies: int,
+    window_start: float,
+    window_count: int,
+) -> tuple[int, int, float, int]:
+    """Publish one live event and return updated counters."""
+    snapshot, is_anomaly = generate_live_event(implant_id, group_id)
+    if is_anomaly:
+        total_anomalies += 1
+    publish(producer, snapshot)
+    total_published += 1
+    window_count += 1
+    window_start, window_count = enforce_rate_limit(
+        window_start, window_count, config.LIVE_PHASE_MAX_EVENTS_PER_SECOND,
+    )
+    return total_published, total_anomalies, window_start, window_count
+
+
 def publish_live_round(
     producer: Producer,
     implants: list[tuple[str, str]],
@@ -272,22 +305,37 @@ def publish_live_round(
 ) -> tuple[int, int, float, int, bool]:
     """Publish one event per implant. Returns updated counters and whether cap was reached."""
     for implant_id, group_id in implants:
-        snapshot, is_anomaly = generate_live_event(implant_id, group_id)
-        if is_anomaly:
-            total_anomalies += 1
-
-        publish(producer, snapshot)
-        total_published += 1
-        window_count += 1
-
-        window_start, window_count = enforce_rate_limit(
-            window_start, window_count, config.LIVE_PHASE_MAX_EVENTS_PER_SECOND,
+        total_published, total_anomalies, window_start, window_count = (
+            publish_single_live_event(
+                producer, implant_id, group_id,
+                total_published, total_anomalies, window_start, window_count,
+            )
         )
-
         if has_reached_event_cap(total_published):
             return total_published, total_anomalies, window_start, window_count, True
-
     return total_published, total_anomalies, window_start, window_count, False
+
+
+def stream_live_rounds(producer: Producer, implants: list[tuple[str, str]]) -> None:
+    """Run the live publishing loop until cap is reached or interrupted."""
+    total_published = 0
+    total_anomalies = 0
+    window_start = time.monotonic()
+    window_count = 0
+    while True:
+        total_published, total_anomalies, window_start, window_count, capped = (
+            publish_live_round(
+                producer, implants, total_published, total_anomalies,
+                window_start, window_count,
+            )
+        )
+        if capped:
+            producer.flush()
+            log_live_summary(total_published, total_anomalies, "reached event cap")
+            return
+        if total_published % config.INGESTOR_LOG_INTERVAL_MESSAGES == 0:
+            producer.flush()
+            log_live_summary(total_published, total_anomalies, "progress")
 
 
 def run_live_phase(producer: Producer, implants: list[tuple[str, str]]) -> None:
@@ -298,29 +346,10 @@ def run_live_phase(producer: Producer, implants: list[tuple[str, str]]) -> None:
         config.LIVE_PHASE_MAX_EVENTS_PER_SECOND or "unlimited",
         config.LIVE_PHASE_MAX_EVENTS or "unlimited",
     )
-    total_published = 0
-    total_anomalies = 0
-    window_start = time.monotonic()
-    window_count = 0
-
     try:
-        while True:
-            total_published, total_anomalies, window_start, window_count, capped = (
-                publish_live_round(
-                    producer, implants, total_published, total_anomalies,
-                    window_start, window_count,
-                )
-            )
-            if capped:
-                producer.flush()
-                log_live_summary(total_published, total_anomalies, "reached event cap")
-                return
-            if total_published % config.INGESTOR_LOG_INTERVAL_MESSAGES == 0:
-                producer.flush()
-                log_live_summary(total_published, total_anomalies, "progress")
+        stream_live_rounds(producer, implants)
     except KeyboardInterrupt:
-        producer.flush()
-        log_live_summary(total_published, total_anomalies, "stopped")
+        logger.info("Live phase stopped by user")
 
 
 def log_live_summary(total_published: int, total_anomalies: int, reason: str) -> None:
@@ -332,28 +361,29 @@ def log_live_summary(total_published: int, total_anomalies: int, reason: str) ->
     )
 
 
-def main() -> None:
+def setup_generator() -> tuple[Producer, list[tuple[str, str]]]:
+    """Initialise the Kafka producer and build the implant list."""
     implants = build_implant_list()
     logger.info(
         "%d implants across %d groups: %s",
         len(implants), len(config.IMPLANT_GROUPS),
         ", ".join(f"{group}={count}" for group, count in config.IMPLANT_GROUPS.items()),
     )
-
     ensure_topic_exists(config.KAFKA_BOOTSTRAP, config.KAFKA_TOPIC)
     producer = make_producer()
     logger.info("Kafka producer connected to %s", config.KAFKA_BOOTSTRAP)
+    return producer, implants
 
+
+def main() -> None:
+    producer, implants = setup_generator()
     logger.info("=== Baseline: generating synthetic history ===")
     total_baseline_events = run_baseline_phase(producer, implants)
-
     logger.info("=== Baseline: waiting for ingestor ===")
     wait_for_ingestor(total_baseline_events)
-
     logger.info("=== Baseline: bootstrapping models ===")
     bootstrap_baselines()
     save_baseline_cursor()
-
     logger.info("=== Live: streaming with anomaly injection ===")
     run_live_phase(producer, implants)
 

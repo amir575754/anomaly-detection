@@ -30,6 +30,16 @@ from detection.trained_model import TrainedModel
 logger = logging.getLogger(__name__)
 
 
+def clamp_fences(
+    raw_lower: float,
+    raw_upper: float,
+    p1: float,
+    p99: float,
+) -> tuple[float, float]:
+    """Clamp IQR fences to robust percentile bounds (P1/P99)."""
+    return max(raw_lower, p1), min(raw_upper, p99)
+
+
 def compute_single_feature_fence(
     feature_vectors: list[dict[str, float]],
     feature_name: str,
@@ -49,13 +59,14 @@ def compute_single_feature_fence(
     iqr = float(q3 - q1)
     raw_lower = float(q1) - multiplier * iqr
     raw_upper = float(q3) + multiplier * iqr
+    lower_fence, upper_fence = clamp_fences(raw_lower, raw_upper, float(p1), float(p99))
     return {
         "Q1": float(q1),
         "Q3": float(q3),
         "IQR": iqr,
         "median": float(median_value),
-        "lower_fence": max(raw_lower, float(p1)),
-        "upper_fence": min(raw_upper, float(p99)),
+        "lower_fence": lower_fence,
+        "upper_fence": upper_fence,
     }
 
 
@@ -104,24 +115,33 @@ def filter_low_variance_features(
     return active
 
 
-def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> TrainedModel:
-    """Fit an Isolation Forest and return a TrainedModel with all scoring metadata."""
-    if not feature_vectors:
-        raise ValueError("Cannot train IsolationForest on zero samples")
-
+def select_active_features(
+    feature_vectors: list[dict[str, float]],
+) -> list[str]:
+    """Pick features with sufficient variance, falling back to all features."""
     all_feature_names = sorted(feature_vectors[0].keys())
     active_features = filter_low_variance_features(feature_vectors, all_feature_names)
-
     if not active_features:
         logger.warning("All features dropped by variance filter — using all features")
-        active_features = all_feature_names
+        return all_feature_names
+    return active_features
 
+
+def build_training_matrix(
+    feature_vectors: list[dict[str, float]],
+    active_features: list[str],
+) -> tuple[np.ndarray, StandardScaler]:
+    """Build a raw matrix from feature vectors and scale it."""
     raw_matrix = np.array(
         [[vector.get(name, 0.0) for name in active_features] for vector in feature_vectors]
     )
     scaler = StandardScaler()
     matrix = scaler.fit_transform(raw_matrix)
+    return matrix, scaler
 
+
+def fit_isolation_forest(matrix: np.ndarray) -> IsolationForest:
+    """Create and fit an IsolationForest on the scaled training matrix."""
     logger.debug(
         "Training IsolationForest: %d samples x %d features, "
         "n_estimators=%d, contamination=%s",
@@ -135,16 +155,35 @@ def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> TrainedMo
         random_state=config.ISOLATION_FOREST_RANDOM_STATE,
     )
     model.fit(matrix)
+    return model
 
+
+def compute_training_score_stats(
+    model: IsolationForest,
+    matrix: np.ndarray,
+    active_feature_count: int,
+) -> tuple[float, float]:
+    """Compute mean and std of decision_function scores on the training data."""
     train_scores = model.decision_function(matrix)
     train_score_mean = float(np.mean(train_scores))
     train_score_std = float(np.std(train_scores))
-
     logger.debug(
         "IsolationForest trained: active_features=%d, "
         "train_score_mean=%.4f, train_score_std=%.4f",
-        len(active_features), train_score_mean, train_score_std,
+        active_feature_count, train_score_mean, train_score_std,
     )
+    return train_score_mean, train_score_std
+
+
+def train_isolation_forest(feature_vectors: list[dict[str, float]]) -> TrainedModel:
+    """Fit an Isolation Forest and return a TrainedModel with all scoring metadata."""
+    if not feature_vectors:
+        raise ValueError("Cannot train IsolationForest on zero samples")
+
+    active_features = select_active_features(feature_vectors)
+    matrix, scaler = build_training_matrix(feature_vectors, active_features)
+    model = fit_isolation_forest(matrix)
+    train_score_mean, train_score_std = compute_training_score_stats(model, matrix, len(active_features))
     return TrainedModel(
         model=model,
         active_features=active_features,
@@ -293,6 +332,28 @@ def load_model_from_redis(
     }
 
 
+def read_write_counters(
+    redis_connection: redis_module.Redis,
+    scope: str,
+    scope_id: str,
+    config_type: str,
+) -> tuple[int, int] | None:
+    """Read trained-at and current write counters from Redis. Returns None if either is missing."""
+    model_key = f"model:{scope}:{scope_id}:{config_type}"
+    trained_at_writes: bytes | None = redis_connection.hget(model_key, "trained_at_writes")  # type: ignore[assignment]
+    if trained_at_writes is None:
+        logger.debug("No model exists for %s — retrain required", model_key)
+        return None
+
+    window_writes_key = f"writes:{scope}:{scope_id}:{config_type}"
+    current_writes: bytes | None = redis_connection.get(window_writes_key)  # type: ignore[assignment]
+    if current_writes is None:
+        logger.debug("No write counter for %s — retrain required", window_writes_key)
+        return None
+
+    return int(trained_at_writes), int(current_writes)
+
+
 def should_retrain(
     redis_connection: redis_module.Redis,
     scope: str,
@@ -308,22 +369,15 @@ def should_retrain(
     when ltrim caps the window, so it reliably tracks new arrivals even at
     steady state.
     """
-    model_key = f"model:{scope}:{scope_id}:{config_type}"
-    trained_at_writes: bytes | None = redis_connection.hget(model_key, "trained_at_writes")  # type: ignore[assignment]
-
-    if trained_at_writes is None:
-        logger.debug("No model exists for %s — retrain required", model_key)
+    counters = read_write_counters(redis_connection, scope, scope_id, config_type)
+    if counters is None:
         return True
 
-    window_writes_key = f"writes:{scope}:{scope_id}:{config_type}"
-    current_writes: bytes | None = redis_connection.get(window_writes_key)  # type: ignore[assignment]
-    if current_writes is None:
-        logger.debug("No write counter for %s — retrain required", window_writes_key)
-        return True
-
-    delta = int(current_writes) - int(trained_at_writes)
+    trained_at, current = counters
+    delta = current - trained_at
     needs_retrain = delta >= config.RETRAIN_THRESHOLD
     if needs_retrain:
+        model_key = f"model:{scope}:{scope_id}:{config_type}"
         logger.debug(
             "Retrain triggered for %s: %d new writes since last training (threshold=%d)",
             model_key, delta, config.RETRAIN_THRESHOLD,

@@ -88,6 +88,30 @@ def resolve_baseline_scope(
     return "group", group_id
 
 
+def resolve_scope_for_row(
+    redis_connection: redis_module.Redis,
+    row: dict,
+    implant_registry: dict[str, dict],
+    now: datetime,
+    scope_map: dict[tuple[str, str], tuple[str, str]],
+    needed: set[tuple[str, str, str]],
+) -> str | None:
+    """Resolve and record the baseline scope for a single row. Returns 'excluded', 'unknown', or None on success."""
+    config_type = row["config_type"]
+    if config_type in config.DETECTION_EXCLUDED_CONFIG_TYPES:
+        return "excluded"
+    implant = implant_registry.get(row["implant_id"])
+    if implant is None:
+        return "unknown"
+    scope, scope_id = resolve_baseline_scope(
+        redis_connection, row["implant_id"], implant["group_id"],
+        implant["first_seen"], config_type, now,
+    )
+    scope_map[(row["implant_id"], config_type)] = (scope, scope_id)
+    needed.add((scope, scope_id, config_type))
+    return None
+
+
 def resolve_scopes_for_batch(
     redis_connection: redis_module.Redis,
     telemetry_rows: list[dict],
@@ -101,20 +125,11 @@ def resolve_scopes_for_batch(
     skipped_unknown = 0
 
     for row in telemetry_rows:
-        config_type = row["config_type"]
-        if config_type in config.DETECTION_EXCLUDED_CONFIG_TYPES:
+        result = resolve_scope_for_row(redis_connection, row, implant_registry, now, scope_map, needed)
+        if result == "excluded":
             skipped_excluded += 1
-            continue
-        implant = implant_registry.get(row["implant_id"])
-        if implant is None:
+        elif result == "unknown":
             skipped_unknown += 1
-            continue
-        scope, scope_id = resolve_baseline_scope(
-            redis_connection, row["implant_id"], implant["group_id"],
-            implant["first_seen"], config_type, now,
-        )
-        scope_map[(row["implant_id"], config_type)] = (scope, scope_id)
-        needed.add((scope, scope_id, config_type))
 
     return scope_map, needed, skipped_excluded, skipped_unknown
 
@@ -187,50 +202,70 @@ def get_max_telemetry_id(db_connection: psycopg2.extensions.connection) -> int:
         return row[0] if row else 0
 
 
+def extract_features_from_row(row: dict) -> dict[str, float]:
+    """Parse the features column, handling both dict and JSON string formats."""
+    if isinstance(row["features"], dict):
+        return row["features"]
+    return json.loads(row["features"])
+
+
+def resolve_cached_model(
+    row: dict,
+    scope_map: dict[tuple, tuple],
+    model_cache: dict[tuple, dict | None],
+) -> tuple[str, dict] | None:
+    """Look up the baseline scope and cached model for a row. Returns (scope, model) or None."""
+    scope_entry = scope_map.get((row["implant_id"], row["config_type"]))
+    if scope_entry is None:
+        return None
+    scope, scope_id = scope_entry
+    cached_model = model_cache.get((scope, scope_id, row["config_type"]))
+    if cached_model is None:
+        return None
+    return scope, cached_model
+
+
 def score_row_with_cache(
     row: dict,
     scope_map: dict[tuple, tuple],
     model_cache: dict[tuple, dict | None],
 ) -> ScoredEvent | None:
     """Score one telemetry row using pre-loaded scope map and model cache."""
-    implant_id = row["implant_id"]
-    config_type = row["config_type"]
-    features = (
-        row["features"] if isinstance(row["features"], dict)
-        else json.loads(row["features"])
-    )
-
-    scope_entry = scope_map.get((implant_id, config_type))
-    if scope_entry is None:
+    features = extract_features_from_row(row)
+    resolved = resolve_cached_model(row, scope_map, model_cache)
+    if resolved is None:
         return None
-    scope, scope_id = scope_entry
+    scope, cached_model = resolved
 
-    cached_model = model_cache.get((scope, scope_id, config_type))
-    if cached_model is None:
-        return None
-
-    deviations = score_with_iqr(features, cached_model["iqr_fences"])
     trained_model = cached_model["trained_model"]
+    deviations = score_with_iqr(features, cached_model["iqr_fences"])
     isolation_forest_score = score_with_isolation_forest(features, trained_model)
-
-    shap_contributions = []
-    if isolation_forest_score >= config.ISOLATION_FOREST_MEDIUM_THRESHOLD:
-        shap_contributions = explain_isolation_forest(features, trained_model)
-
-    if deviations or shap_contributions:
-        logger.debug(
-            "Telemetry id=%s implant=%s: %d IQR deviations, IF score=%.3f, %d SHAP features",
-            row.get("id"), implant_id, len(deviations), isolation_forest_score,
-            len(shap_contributions),
-        )
-
+    shap_contributions = (explain_isolation_forest(features, trained_model)
+                          if isolation_forest_score >= config.ISOLATION_FOREST_MEDIUM_THRESHOLD else [])
     return ScoredEvent(
-        telemetry_row=row,  # type: ignore[arg-type]  # RealDictCursor row is structurally compatible
-        deviating_features=deviations,
-        isolation_forest_score=isolation_forest_score,
-        baseline_used=scope,
+        telemetry_row=row, deviating_features=deviations,
+        isolation_forest_score=isolation_forest_score, baseline_used=scope,
         shap_contributions=shap_contributions,
     )
+
+
+def try_retrain_baseline(
+    redis_connection: redis_module.Redis,
+    db_connection: psycopg2.extensions.connection,
+    scope: str,
+    scope_id: str,
+    config_type: str,
+) -> Exception | None:
+    """Attempt to retrain a single baseline. Returns the exception on failure, None on success."""
+    try:
+        refresh_baseline(redis_connection, db_connection, scope, scope_id, config_type)
+        return None
+    except Exception as exception:
+        logger.error(
+            "Baseline refresh failed for %s:%s:%s", scope, scope_id, config_type,
+            exc_info=True,
+        )
+        return exception
 
 
 def retrain_stale_baselines(
@@ -240,28 +275,32 @@ def retrain_stale_baselines(
     """Check all window keys and retrain any baselines that need refreshing."""
     window_keys = discover_window_keys(redis_connection)
     retrained = 0
-    failures: list[tuple[str, str, str, Exception]] = []
+    failures: list[tuple[str, str, str]] = []
     for scope, scope_id, config_type in window_keys:
-        if should_retrain(redis_connection, scope, scope_id, config_type):
-            try:
-                refresh_baseline(
-                    redis_connection, db_connection, scope, scope_id, config_type
-                )
-                retrained += 1
-            except Exception as exception:
-                logger.error(
-                    "Baseline refresh failed for %s:%s:%s", scope, scope_id, config_type,
-                    exc_info=True,
-                )
-                failures.append((scope, scope_id, config_type, exception))
+        if not should_retrain(redis_connection, scope, scope_id, config_type):
+            continue
+        if try_retrain_baseline(redis_connection, db_connection, scope, scope_id, config_type) is None:
+            retrained += 1
+        else:
+            failures.append((scope, scope_id, config_type))
     if retrained > 0:
         logger.info("Retrained %d / %d baselines this tick", retrained, len(window_keys))
     if failures:
-        logger.warning(
-            "%d baseline refresh(es) failed: %s",
-            len(failures),
-            ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct, _ in failures),
-        )
+        failed_keys = ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct in failures)
+        logger.warning("%d baseline refresh(es) failed: %s", len(failures), failed_keys)
+
+
+def try_score_row(
+    row: dict,
+    scope_map: dict[tuple, tuple],
+    model_cache: dict[tuple, dict | None],
+) -> ScoredEvent | None:
+    """Score a single row, logging and returning None on failure."""
+    try:
+        return score_row_with_cache(row, scope_map, model_cache)
+    except Exception:
+        logger.error("Scoring failed for row id=%s", row.get("id"), exc_info=True)
+        return None
 
 
 def score_all_rows(
@@ -271,20 +310,18 @@ def score_all_rows(
 ) -> list[ScoredEvent]:
     """Score each telemetry row, returning only successfully scored events."""
     scored_events = []
-    failures: list[tuple[int | None, Exception]] = []
+    failure_ids: list[int | None] = []
     for row in telemetry_rows:
-        try:
-            scored = score_row_with_cache(row, scope_map, model_cache)
-            if scored is not None:
-                scored_events.append(scored)
-        except Exception as exception:
-            logger.error("Scoring failed for row id=%s", row.get("id"), exc_info=True)
-            failures.append((row.get("id"), exception))
-    if failures:
+        scored = try_score_row(row, scope_map, model_cache)
+        if scored is not None:
+            scored_events.append(scored)
+        elif row.get("id") is not None:
+            failure_ids.append(row.get("id"))
+    if failure_ids:
         logger.warning(
             "%d row(s) failed scoring: %s",
-            len(failures),
-            ", ".join(str(row_id) for row_id, _ in failures),
+            len(failure_ids),
+            ", ".join(str(row_id) for row_id in failure_ids),
         )
     return scored_events
 
@@ -298,6 +335,26 @@ RESET_COLOR = "\033[0m"
 DIM = "\033[2m"
 
 
+def format_iqr_lines(event: ScoredEvent) -> list[str]:
+    """Format IQR deviation lines for a detection."""
+    return [
+        f"  ├─ IQR: {d.feature_name} = {d.observed_value:.4g} "
+        f"{DIM}(expected {d.lower_fence:.4g}–{d.upper_fence:.4g}, "
+        f"median {d.expected_median:.4g}){RESET_COLOR}"
+        for d in event.deviating_features
+    ]
+
+
+def format_shap_line(event: ScoredEvent) -> str | None:
+    """Format a SHAP contribution line, or None if not applicable."""
+    if not event.shap_contributions or event.deviating_features:
+        return None
+    shap_parts = ", ".join(
+        f"{c.feature_name} ({c.contribution:+.3f})" for c in event.shap_contributions
+    )
+    return f"  ├─ SHAP: {shap_parts}"
+
+
 def format_detection(event: ScoredEvent, severity: Severity) -> str:
     """Format a scored event as a human-readable CLI detection line."""
     row = event.telemetry_row
@@ -306,18 +363,10 @@ def format_detection(event: ScoredEvent, severity: Severity) -> str:
         f"{color}[{severity.value}]{RESET_COLOR} "
         f"{row['implant_id']} ({row['group_id']}) {row['config_type']}"
     ]
-    for deviation in event.deviating_features:
-        lines.append(
-            f"  ├─ IQR: {deviation.feature_name} = {deviation.observed_value:.4g} "
-            f"{DIM}(expected {deviation.lower_fence:.4g}–{deviation.upper_fence:.4g}, "
-            f"median {deviation.expected_median:.4g}){RESET_COLOR}"
-        )
-    if event.shap_contributions and not event.deviating_features:
-        shap_parts = ", ".join(
-            f"{c.feature_name} ({c.contribution:+.3f})"
-            for c in event.shap_contributions
-        )
-        lines.append(f"  ├─ SHAP: {shap_parts}")
+    lines.extend(format_iqr_lines(event))
+    shap_line = format_shap_line(event)
+    if shap_line is not None:
+        lines.append(shap_line)
     lines.append(f"  └─ IF score: {event.isolation_forest_score:.3f}")
     return "\n".join(lines)
 
@@ -382,50 +431,78 @@ def run_single_tick(
     return new_cursor, has_more
 
 
-MAX_CONSECUTIVE_FAILURES = 5
+def wait_for_baseline_cursor(redis_connection: redis_module.Redis) -> int:
+    """Poll Redis until the baseline cursor exists. Returns last_processed_id."""
+    baseline_cursor = redis_connection.get("detector:baseline_cursor")
+    while baseline_cursor is None:
+        logger.info("Waiting for baseline phase to complete (no cursor in Redis yet)...")
+        time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
+        baseline_cursor = redis_connection.get("detector:baseline_cursor")
+    last_processed_id = int(baseline_cursor)
+    logger.info("Baseline cursor found — starting detection from telemetry id %d", last_processed_id)
+    return last_processed_id
 
 
-def run() -> None:
+def connect_infrastructure() -> tuple[psycopg2.extensions.connection, redis_module.Redis]:
+    """Create and return database and Redis connections."""
     logger.info("Connecting to PostgreSQL and Redis")
     db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False,
     )
+    return db_connection, redis_connection
 
+
+def execute_tick(
+    db_connection: psycopg2.extensions.connection,
+    redis_connection: redis_module.Redis,
+    last_processed_id: int,
+    tick_number: int,
+    consecutive_failures: int,
+) -> tuple[int, bool, int]:
+    """Run one tick with error handling. Returns (last_processed_id, has_more, consecutive_failures)."""
     try:
-        baseline_cursor = redis_connection.get("detector:baseline_cursor")
-        while baseline_cursor is None:
-            logger.info("Waiting for baseline phase to complete (no cursor in Redis yet)...")
+        last_processed_id, has_more = run_single_tick(
+            db_connection, redis_connection, last_processed_id,
+        )
+        return last_processed_id, has_more, 0
+    except Exception:
+        consecutive_failures += 1
+        backoff = min(consecutive_failures * 5, 30)
+        logger.warning(
+            "Tick #%d failed (%d consecutive) — backing off %.0fs",
+            tick_number, consecutive_failures, backoff, exc_info=True,
+        )
+        time.sleep(backoff)
+        return last_processed_id, False, consecutive_failures
+
+
+def run_tick_loop(
+    db_connection: psycopg2.extensions.connection,
+    redis_connection: redis_module.Redis,
+    last_processed_id: int,
+) -> None:
+    """Run the detection loop indefinitely, with exponential back-off on failures."""
+    tick_number = 0
+    consecutive_failures = 0
+    while True:
+        tick_number += 1
+        tick_start = time.monotonic()
+        logger.info("=== Tick #%d ===", tick_number)
+        last_processed_id, has_more, consecutive_failures = execute_tick(
+            db_connection, redis_connection, last_processed_id, tick_number, consecutive_failures,
+        )
+        logger.info("Tick #%d done in %.1fs", tick_number, time.monotonic() - tick_start)
+        if not has_more:
             time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
-            baseline_cursor = redis_connection.get("detector:baseline_cursor")
 
-        last_processed_id = int(baseline_cursor)
-        logger.info("Baseline cursor found — starting detection from telemetry id %d", last_processed_id)
 
-        tick_number = 0
-        consecutive_failures = 0
-        while True:
-            tick_number += 1
-            tick_start = time.monotonic()
-            logger.info("=== Tick #%d ===", tick_number)
-            has_more = False
-            try:
-                last_processed_id, has_more = run_single_tick(
-                    db_connection, redis_connection, last_processed_id,
-                )
-                consecutive_failures = 0
-            except Exception:
-                consecutive_failures += 1
-                logger.critical("Tick #%d failed (%d consecutive)", tick_number, consecutive_failures, exc_info=True)
-                if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-                    raise RuntimeError(
-                        f"Aborting after {MAX_CONSECUTIVE_FAILURES} consecutive tick failures"
-                    )
-            logger.info("Tick #%d done in %.1fs", tick_number, time.monotonic() - tick_start)
-            if has_more:
-                logger.info("Backlog detected — running next tick immediately")
-            else:
-                time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
+def run() -> None:
+    """Orchestrate infrastructure setup, baseline wait, and detection loop."""
+    db_connection, redis_connection = connect_infrastructure()
+    try:
+        last_processed_id = wait_for_baseline_cursor(redis_connection)
+        run_tick_loop(db_connection, redis_connection, last_processed_id)
     finally:
         db_connection.close()
         redis_connection.close()
