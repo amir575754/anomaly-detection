@@ -33,11 +33,11 @@ IQR_SIGNIFICANT_MULTIPLIER: float = 5.0
 # Minimum number of IQR-deviating features for "significant" deviation
 IQR_SIGNIFICANT_FEATURE_COUNT: int = 2
 
-# Isolation Forest anomaly score threshold for HIGH severity
-ISOLATION_FOREST_HIGH_THRESHOLD: float = 0.7
+# Isolation Forest anomaly score threshold for HIGH severity (and LOW = IF-only above this)
+ISOLATION_FOREST_HIGH_THRESHOLD: float = 0.90
 
-# Isolation Forest anomaly score threshold for MEDIUM severity
-ISOLATION_FOREST_MEDIUM_THRESHOLD: float = 0.5
+# Isolation Forest anomaly score threshold for MEDIUM severity (confirms single-IQR deviations)
+ISOLATION_FOREST_MEDIUM_THRESHOLD: float = 0.75
 
 # Isolation Forest: number of trees in the ensemble
 ISOLATION_FOREST_ESTIMATORS: int = 50
