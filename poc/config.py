@@ -117,8 +117,8 @@ DETECTION_IDLE_SLEEP_SECONDS: int = 1
 # Maximum telemetry rows scored per tick
 MAX_ROWS_PER_DETECTION_TICK: int = 5000
 
-# Maximum baselines retrained per tick (prevents long stalls on first tick)
-MAX_RETRAINS_PER_TICK: int = 5
+# Maximum baselines retrained per tick (0 = unlimited)
+MAX_RETRAINS_PER_TICK: int = 0
 
 
 # ---------------------------------------------------------------------------

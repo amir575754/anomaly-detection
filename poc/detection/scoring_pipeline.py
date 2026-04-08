@@ -122,8 +122,9 @@ def retrain_stale_baselines(
     window_keys = discover_window_keys(redis_connection)
     retrained = 0
     failed_scopes: list[tuple[str, str, str]] = []
+    cap = config.MAX_RETRAINS_PER_TICK
     for scope, scope_id, config_type in window_keys:
-        if retrained >= config.MAX_RETRAINS_PER_TICK:
+        if cap > 0 and retrained >= cap:
             break
         if not should_retrain(redis_connection, scope, scope_id, config_type):
             continue
