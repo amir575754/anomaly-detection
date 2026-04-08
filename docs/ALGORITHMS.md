@@ -64,6 +64,18 @@ This is why we use multiple algorithms instead of one — they each see differen
 
 ## 3. Our Feature Engineering Philosophy
 
+> **PoC Assumption — Synthetic Data**
+>
+> All "typical ranges," "baseline correlations," and "normal behavior" described below are properties of the **synthetic data generator** (`profiles.py`), not observations from real implant telemetry. The generator uses hand-picked probability distributions and correlation structures that are plausible but unvalidated against real operational data. Specific assumptions to be aware of:
+>
+> - **Probability values** (e.g., "55% of configs enable obfuscate_strings," "35% surveillance posture") were chosen by the PoC authors to create realistic-looking data, not estimated from real operator behavior.
+> - **Correlation structures** (beacon drives jitter/retries/sleep, method count drives registry/task counts, evasion techniques follow a layered dependency chain) are intentional design choices that give the ML models learnable patterns. Real telemetry may have different, weaker, or additional correlations.
+> - **Feature ranges** reflect the generator's clamped random distributions. Real telemetry ranges may be wider, narrower, or multimodal.
+> - **Algorithm parameters** (IQR multiplier=2.0, contamination=0.02, 500 IF trees, etc.) were tuned to perform well on this synthetic data. They will need re-tuning on real data.
+> - **Detection rates** (82.1% detection, 28.9% FP) are measured against synthetic anomalies. Real operator mistakes may be subtler or more diverse.
+>
+> When moving to production, the synthetic generator should be replaced by real telemetry, and all thresholds and correlations should be re-evaluated.
+
 Before any algorithm runs, raw configuration snapshots are transformed into **feature vectors** — flat lists of numbers that capture the operational semantics of a configuration. This transformation is critical because algorithms work on numbers, not nested JSON.
 
 ### Design Principle: Capture Operational Meaning, Not Anomaly Patterns
@@ -93,7 +105,7 @@ Below is every feature the system extracts, grouped by configuration type. Each 
 | `c2_enabled_count` | How many of those C2 channels are currently enabled. | 0 – 3 |
 | `c2_unique_protocols` | Number of distinct protocols across all channels (https, dns, smb, etc.). | 1 – 3 |
 | `c2_non_standard_ports` | Count of channels using ports other than 80, 443, or 53. Non-standard ports are more likely to be flagged by network monitoring. | 0 – 3 |
-| `beacon_to_sleep_ratio` | `beacon_interval_ms / sleep_on_failure_ms`. Captures the operational relationship between normal timing and failure recovery. In baseline data this ratio is stable because both are driven by the same beacon parameter. | 2.0 – 5.5 |
+| `beacon_to_sleep_ratio` | `beacon_interval_ms / sleep_on_failure_ms`. Captures the operational relationship between normal timing and failure recovery. In the synthetic baseline data this ratio is stable because the generator derives both values from a single normalized beacon parameter. Real telemetry should be checked for whether this correlation holds. | 2.0 – 5.5 |
 | `beacon_to_rotation_ratio` | `beacon_interval_ms / key_rotation_hours`. Captures how beacon timing relates to cryptographic freshness. | 700 – 2,300 |
 | `jitter_retries_product` | `jitter_percentage * max_retries`. Captures the interaction between randomization and resilience — high jitter with high retries means a very different failure profile than low jitter with low retries. | 0.5 – 1.3 |
 
@@ -122,12 +134,12 @@ Below is every feature the system extracts, grouped by configuration type. Each 
 | Feature | Description | Typical Range |
 |---|---|---|
 | `active_method_count` | Number of active persistence methods (registry_run, scheduled_task, service_install, etc.). Drives the "depth" of persistence. | 1 – 3 |
-| `registry_key_count` | Number of registry keys used for persistence. In baseline data, this correlates with `active_method_count` — more methods need more keys. | 1 – 5 |
+| `registry_key_count` | Number of registry keys used for persistence. In the synthetic baseline, this correlates with `active_method_count` because the generator uses depth-dependent lookup tables (hand-picked ranges per depth level). This correlation should be verified on real data. | 1 – 5 |
 | `scheduled_task_count` | Number of scheduled tasks created for persistence. Like registry keys, correlates with depth. | 0 – 3 |
-| `watchdog_enabled` | 1.0 if a watchdog process monitors persistence health, 0.0 otherwise. Normally only enabled at high depth (3 methods). | 0 or 1 |
+| `watchdog_enabled` | 1.0 if a watchdog process monitors persistence health, 0.0 otherwise. In the synthetic generator, this is enabled with 80% probability at depth 3 but only 10% at depth 1 (hand-picked values). | 0 or 1 |
 | `reinstall_on_removal` | 1.0 if the implant reinstalls itself when persistence is removed, 0.0 otherwise. Like watchdog, correlates with depth. | 0 or 1 |
 | `total_persistence_footprint` | `active_method_count + registry_key_count + scheduled_task_count`. A single number capturing overall persistence weight on the host. | 2 – 11 |
-| `safety_to_depth_ratio` | `(watchdog_enabled + reinstall_on_removal) / active_method_count`. Measures how much safety infrastructure exists per persistence method. In baseline data, deep persistence (3 methods) has high safety (ratio ~0.5–0.7), while shallow persistence (1 method) has low safety (ratio ~0.0). The `duplicated_persistence_setup` anomaly violates this: 1 method with both safety nets enabled (ratio = 2.0). | 0.0 – 1.0 |
+| `safety_to_depth_ratio` | `(watchdog_enabled + reinstall_on_removal) / active_method_count`. Measures how much safety infrastructure exists per persistence method. In the synthetic generator, deep persistence (3 methods) has high safety (ratio ~0.5–0.7), while shallow persistence (1 method) has low safety (ratio ~0.0) — this correlation comes from the hand-picked depth-dependent probability tables in `profiles.py`. The `duplicated_persistence_setup` anomaly violates this: 1 method with both safety nets enabled (ratio = 2.0). | 0.0 – 1.0 |
 
 #### Capability Configuration (9 features)
 
@@ -141,11 +153,11 @@ Below is every feature the system extracts, grouped by configuration type. Each 
 | `non_surveillance_enabled_count` | `enabled_count - active_surveillance_count`. Enabled capabilities that are NOT surveillance. | 0 – 6 |
 | `resource_per_capability` | `max_concurrent_tasks / enabled_count`. How many execution slots exist per enabled capability. Low values mean capabilities are competing for resources. | 0.3 – 2.0 |
 | `surveillance_ratio` | `active_surveillance_count / enabled_count`. What fraction of enabled capabilities are surveillance. The `forgotten_operation_teardown` anomaly produces a high surveillance ratio paired with passive resource settings — a contradiction. | 0.0 – 1.0 |
-| `concurrency_timeout_product` | `max_concurrent_tasks * task_timeout_ms / 1000`. Captures the overall resource commitment — high concurrency with long timeouts means the implant is dedicating significant host resources. In baseline data, surveillance posture has high concurrency + short timeouts, while passive posture has low concurrency + long timeouts, so this product stays in a narrow band. | 60 – 480 |
+| `concurrency_timeout_product` | `max_concurrent_tasks * task_timeout_ms / 1000`. Captures the overall resource commitment — high concurrency with long timeouts means the implant is dedicating significant host resources. In the synthetic generator, 35% of configs are "surveillance" posture (high concurrency + short timeouts) and 65% are "passive" (low concurrency + long timeouts) — hand-picked split — so this product stays in a narrow band. | 60 – 480 |
 
 #### Evasion Configuration (11 features)
 
-**Understanding the dependency chain:** The "dependencies" between evasion techniques are not hard technical requirements — AMSI bypass does not literally require string obfuscation to function. They are **behavioral correlations built into the synthetic data generator** that model how real operators tend to enable techniques in layers. An operator who enables the basics (string obfuscation) is much more likely to also enable the next tier (AMSI bypass: 65% chance) than an operator who skipped the basics (8% chance). This conditional-probability structure creates learnable correlations in the baseline data. The `dependency_coherence` feature measures whether a configuration follows these expected behavioral patterns — configurations that violate them (advanced techniques without foundations) are statistically unusual and worth flagging.
+**Understanding the dependency chain:** The "dependencies" between evasion techniques are not hard technical requirements — AMSI bypass does not literally require string obfuscation to function. They are **behavioral correlations built into the synthetic data generator** that model how real operators *might* tend to enable techniques in layers. All the conditional probabilities below (55%, 65%, 8%, etc.) were hand-picked by the PoC authors to create plausible correlations, not estimated from observed operator behavior. An operator who enables the basics (string obfuscation) is much more likely to also enable the next tier (AMSI bypass: 65% chance) than an operator who skipped the basics (8% chance). This conditional-probability structure creates learnable correlations in the baseline data. The `dependency_coherence` feature measures whether a configuration follows these expected behavioral patterns — configurations that violate them (advanced techniques without foundations) are statistically unusual and worth flagging.
 
 ```
 Layer 1 (basic):        obfuscate_strings (55% enabled)

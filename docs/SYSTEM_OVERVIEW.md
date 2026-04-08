@@ -309,7 +309,7 @@ Features capture **operational semantics** — the meaning of a configuration in
 | `beacon_to_rotation_ratio` | Interaction | `beacon_interval_ms / key_rotation_hours` — ties beacon timing to crypto freshness |
 | `jitter_retries_product` | Interaction | `jitter_percentage * max_retries` — captures the randomization-resilience interaction |
 
-**Correlated generation:** The synthetic generator ties jitter, retries, sleep, and key rotation to a normalized beacon interval. This creates a manifold of valid configurations. Anomalies that draw features independently (like `wrong_comm_profile`) land off this manifold.
+**Correlated generation (synthetic):** The generator ties jitter, retries, sleep, and key rotation to a normalized beacon interval using hand-picked linear relationships. This creates a manifold of valid configurations that the ML models learn. Whether these correlations exist in real telemetry is unverified — they should be checked during the shadow-mode evaluation phase.
 
 #### Dangerous Program Configuration (15 features)
 
@@ -343,7 +343,7 @@ Features capture **operational semantics** — the meaning of a configuration in
 | `total_persistence_footprint` | Sum | `method_count + registry_keys + scheduled_tasks` — overall persistence weight |
 | `safety_to_depth_ratio` | Ratio | `(watchdog + reinstall) / method_count` — safety infrastructure per method; anomalous when high safety wraps low depth |
 
-**Correlated generation:** Method count drives registry/task counts and safety net probabilities via depth-dependent lookup tables. `duplicated_persistence_setup` violates this by pairing depth-1 methods with depth-3 safety infrastructure.
+**Correlated generation (synthetic):** Method count drives registry/task counts and safety net probabilities via hand-picked depth-dependent lookup tables (e.g., depth 1: registry 1–2, watchdog 10%; depth 3: registry 3–5, watchdog 80%). `duplicated_persistence_setup` violates this by pairing depth-1 methods with depth-3 safety infrastructure. These depth-to-resource mappings are authorial assumptions.
 
 #### Capability Configuration (9 features)
 
@@ -359,7 +359,7 @@ Features capture **operational semantics** — the meaning of a configuration in
 | `surveillance_ratio` | Ratio | `surveillance_count / enabled_count` — what fraction of activity is surveillance |
 | `concurrency_timeout_product` | Interaction | `max_tasks * timeout_ms / 1000` — total resource commitment; stays in a narrow band because high concurrency pairs with short timeouts and vice versa |
 
-**Two-cluster structure:** The generator creates surveillance posture (high surveillance, high concurrency, low timeout) and passive posture (low surveillance, low concurrency, high timeout). `forgotten_operation_teardown` mixes them.
+**Two-cluster structure (synthetic):** The generator splits configs into surveillance posture (35%, hand-picked) and passive posture (65%) with different resource profiles. This two-cluster assumption gives IF/LOF a learnable structure. Real capability configurations may have more nuanced or continuous posture variations.
 
 #### Evasion Configuration (11 features)
 
@@ -377,7 +377,7 @@ Features capture **operational semantics** — the meaning of a configuration in
 | `sleep_obfuscation` | Binary | Layer 3 — sleep hiding; 65% if 2+ layer-2 on, 8% otherwise |
 | `stack_spoof` | Binary | Layer 3 — call stack spoofing; 55% if sleep_obfuscation on, 5% otherwise; rarest technique (~15%) |
 
-**Behavioral dependency chain:** The "dependencies" are not hard technical requirements — they are conditional probabilities in the data generator that model how operators tend to enable techniques in layers (basics first, then advanced). The `dependency_coherence` feature measures whether a configuration follows these expected behavioral patterns. The `full_evasion` anomaly enables advanced techniques while skipping the basics, producing low coherence values that almost never occur in baseline data.
+**Behavioral dependency chain (synthetic):** The "dependencies" are not hard technical requirements — they are conditional probabilities (hand-picked, e.g., 65% / 8%) in the data generator that model how operators *might* tend to enable techniques in layers. Whether real operators follow this layered pattern is unverified. The `dependency_coherence` feature measures whether a configuration follows these expected behavioral patterns. The `full_evasion` anomaly enables advanced techniques while skipping the basics, producing low coherence values that almost never occur in the synthetic baseline data.
 
 ---
 
@@ -503,6 +503,18 @@ After each scoring batch, a summary table shows:
 ---
 
 ## 11. Synthetic Data and Evaluation Methodology
+
+> **Important: All Data Is Synthetic**
+>
+> The entire PoC — baseline data, live telemetry, anomaly injection, and performance numbers — runs on **synthetic data** produced by hand-authored generators (`profiles.py`, `anomalies.py`). No real implant telemetry was used. This means:
+>
+> - **Correlation structures** (beacon drives jitter/retries/sleep; method count drives registry/task counts; evasion flags follow a layered probability chain) are **design choices**, not empirical observations. The probability values (e.g., "55% enable obfuscate_strings," "35% surveillance posture," "70% dominant action") were hand-picked by the PoC authors to produce realistic-looking data.
+> - **Feature ranges** (beacon 25–35k ms, jitter 0.10–0.25, etc.) reflect the generator's clamped random distributions, not observed real-world ranges.
+> - **Anomaly injectors** represent the authors' best guesses at what operator mistakes look like. Real mistakes may be subtler, more diverse, or structured differently.
+> - **Detection rates and FP rates** are validated against this synthetic data only. Performance on real telemetry is unknown and will require re-evaluation.
+> - **Algorithm parameters** (IQR multiplier, contamination rate, tree count, etc.) were tuned to work well on this synthetic data. They should be treated as starting points, not production-ready values.
+>
+> The PoC proves the **architecture and detection approach** work. It does not prove the specific numbers will transfer to production.
 
 ### Data Generation
 
@@ -667,6 +679,8 @@ The PoC uses synthetic data with controlled anomaly injection:
 ---
 
 ## 14. What This PoC Proves
+
+> **Caveat:** All claims below are validated against synthetic data with hand-authored correlation structures and anomaly injectors. They demonstrate that the architecture and algorithms *can* achieve these results when the data has the expected structure. Performance on real telemetry is an open question to be answered during the shadow-mode evaluation phase (see Section 16).
 
 ### 1. Autonomous Detection Is Viable
 
