@@ -47,17 +47,25 @@ def _build_iqr_table(event: ScoredEvent) -> Table | None:
 
 
 def _build_shap_table(event: ScoredEvent) -> Table | None:
-    """Build a mini table of SHAP contributions."""
+    """Build a mini table of SHAP contributions.
+
+    Negative SHAP values push toward anomalous (IF decision_function
+    convention: lower = more anomalous). More negative = bigger
+    contribution to the anomaly.
+    """
     if not event.shap_contributions:
         return None
     table = Table(show_header=False, show_edge=False, box=None, padding=(0, 1))
     table.add_column("feature", style="bold")
     table.add_column("contribution", justify="right")
+    table.add_column("direction", style="dim")
     for contribution in event.shap_contributions:
-        color = "red" if contribution.contribution > 0 else "green"
+        color = "red" if contribution.contribution < 0 else "green"
+        direction = "anomalous" if contribution.contribution < 0 else "normal"
         table.add_row(
             contribution.feature_name,
             f"[{color}]{contribution.contribution:+.3f}[/{color}]",
+            f"[{color}]{direction}[/{color}]",
         )
     return table
 
