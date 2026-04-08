@@ -314,7 +314,7 @@ Imagine a map of a city. Most people live in neighborhoods with many other nearb
 
 ### How It Works
 
-1. **Find k-nearest neighbors:** For each point, find the k=20 closest points in the feature space (using Euclidean distance on scaled features).
+1. **Find k-nearest neighbors:** For each point, find the k=20 closest points in the feature space using Euclidean distance — the straight-line distance across all features: `sqrt((f1_a - f1_b)² + (f2_a - f2_b)² + ...)`. This is computed on StandardScaler-normalized features so that all features contribute equally (without scaling, a feature like `beacon_interval_ms` in the tens of thousands would dominate `jitter_percentage` around 0.15).
 
 2. **Compute local reachability density:** How far away are this point's neighbors? If they're far, the density is low.
 
