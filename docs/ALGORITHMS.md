@@ -215,9 +215,9 @@ Imagine you've recorded the beacon interval for 1000 past snapshots. Most values
    - Upper fence = Q3 + k × IQR
    - Where k is the **multiplier** (we use k=2.0)
 
-3. **Clamp fences** to [P1, P99] — the 1st and 99th percentiles of training data. This prevents fences from extending into impossible ranges (like negative counts).
+3. **Score each feature independently:** If the observed value is outside the fences, compute how far (in IQR units).
 
-4. **Score each feature independently:** If the observed value is outside the fences, compute how far (in IQR units).
+Note: fences can extend into theoretically impossible ranges (e.g., a negative lower fence for a count feature). This is fine — a count value of 0 is within the fence, and negative values never occur in practice. The fences define a statistical boundary, not a physical one.
 
 ### Example
 

@@ -33,14 +33,12 @@ def compute_single_feature_fence(
     """
     multiplier = iqr_multiplier if iqr_multiplier is not None else config.IQR_MULTIPLIER
     values = np.array([vector.get(feature_name, 0.0) for vector in feature_vectors])
-    p1, q1, median_value, q3, p99 = np.percentile(values, [1, 25, 50, 75, 99])
+    q1, median_value, q3 = np.percentile(values, [25, 50, 75])
     iqr = float(q3 - q1)
 
     if iqr > 0:
-        raw_lower = float(q1) - multiplier * iqr
-        raw_upper = float(q3) + multiplier * iqr
-        lower_fence = max(raw_lower, float(p1))
-        upper_fence = min(raw_upper, float(p99))
+        lower_fence = float(q1) - multiplier * iqr
+        upper_fence = float(q3) + multiplier * iqr
     else:
         mad = float(np.median(np.abs(values - median_value)))
         if mad > 0:

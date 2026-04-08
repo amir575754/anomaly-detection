@@ -671,16 +671,16 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 **Why:** The detector reads models on every tick. Sub-millisecond access matters for keeping detection latency low. Redis also naturally supports the sliding-window pattern with rpush/ltrim.
 
-### Decision 6: P1/P99 Fence Clamping
+### Decision 6: No Fence Clamping — Pure IQR Fences
 
-**Chosen:** Clamp IQR fences at the 1st and 99th percentiles of training data.
-**Alternative:** Allow fences to extend beyond the data range.
+**Chosen:** Let IQR fences extend freely based on Q1 - k*IQR and Q3 + k*IQR.
+**Alternative considered and rejected:** Clamp fences at P1/P99 of training data.
 
-**Why:** For features with narrow distributions (like integer counts), the IQR-based fence can extend into impossible ranges (negative counts). Clamping at P1/P99 keeps fences within the observed data range, which is tighter and more sensitive to deviations at the distribution edges.
+**Why not clamp:** Clamping at P1/P99 makes the fence effectively equal to [P1, P99] for most features, rendering the IQR multiplier irrelevant. With k=2.0 and compact distributions, Q1-k*IQR is typically well below P1, so `max(Q1-k*IQR, P1)` always equals P1. This defeats the purpose of having a tunable multiplier.
 
-**Tradeoff:** For bounded features (ratios in [0,1]), P99 may equal 1.0, meaning the upper fence can't catch values at 1.0 even if they're rare. This is why we complement IQR with ML detectors.
+**Tradeoff:** Fences can extend into theoretically impossible ranges (e.g., negative lower fence for a count feature). This is harmless — impossible values never occur in real telemetry, so the fence boundary is never tested there. The fences define a statistical boundary, not a physical one.
 
-**Note on boolean/constant features:** When IQR is zero (common for boolean flags), P1/P99 clamping does not apply. Instead, the system falls back to MAD-based fences (if the data has some spread) or a tight epsilon band (if the feature is truly constant in training). This explains why `full_evasion` — which only flips boolean evasion flags — is difficult to detect: the fences for binary features cover the full 0-1 range observed in training.
+**Note on boolean/constant features:** When IQR is zero (common for boolean flags), the standard formula breaks down. The system falls back to MAD-based fences (if the data has some spread) or a tight epsilon band (if the feature is truly constant in training).
 
 ---
 
