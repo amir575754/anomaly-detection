@@ -374,20 +374,61 @@ Standard Euclidean distance treats all directions equally. But in real data, fea
 
 No single algorithm is perfect. IQR catches single-feature outliers but misses correlations. IF catches complex patterns but can produce noisy scores. LOF captures local structure. By combining their **severity votes**, we get the strengths of all three while mitigating individual weaknesses. (Mahalanobis distance is computed and displayed for diagnostic context but does not participate in severity voting — see Section 7.)
 
-### The Corroboration Principle
+### The Corroboration Principle — And Its Cost
 
-The key insight behind our ensemble: **real anomalies trigger multiple detectors independently; random noise triggers only one.**
+The operating principle: **real anomalies trigger multiple detectors independently; random noise triggers only one.** A beacon_storm will trigger IQR, IF, and LOF simultaneously. A borderline normal event might trigger one ML model but nothing else.
 
-A beacon_storm anomaly (beacon_interval dropped from ~30,000 to ~1,200) will:
-- Trigger IQR (massive deviation on beacon_interval)
-- Trigger IF predict() (unusual point in the feature space)
-- Trigger LOF predict() (sparse neighborhood)
+For most severity levels, we require at least two detector families to agree. The one exception: **IQR significant** (2+ deviating features or an extreme single-feature deviation) fires MEDIUM alone because the evidence is already multi-dimensional and directly interpretable.
 
-But a normal event that happens to have a slightly unusual jitter_percentage might:
-- Trigger IF predict() (borderline score due to noise)
-- Not trigger IQR or LOF
+### Why Not Let Single Detectors Fire Alone?
 
-For most severity levels, we require at least two detector families to agree. The one exception: **IQR significant** (2+ deviating features or an extreme single-feature deviation) is strong enough to fire MEDIUM on its own, because the evidence is already multi-dimensional and directly interpretable.
+This is the natural question: if we chose LOF specifically for local outliers that IF misses, why require IF to confirm? Doesn't that defeat the purpose?
+
+**Yes — partially.** Corroboration is a pragmatic tradeoff, not a theoretically optimal strategy. Here's the measured cost:
+
+In validation against 10,000 events (~377 anomalies):
+- **23 anomalies (6.1%)** are caught by exactly one ML model but suppressed because the other doesn't agree
+- 19 of those are IF-only, 4 are LOF-only
+- They're concentrated in `duplicated_persistence_setup` (13), `self_destruct_flood` (6), and `mismatched_escalation_policy` (4)
+
+If we removed the corroboration requirement and let single ML predictions through, we would catch those 23 extra anomalies — but we'd also admit:
+- **157 IF-only false positives** on clean data
+- **167 LOF-only false positives** on clean data
+
+That's **324 additional FPs to gain 23 TPs** — a 14:1 FP-to-TP ratio on the marginal detections. The FP rate would jump from 13.6% to roughly 75%.
+
+The table below shows every detection pattern observed:
+
+```
+ANOMALY PATTERNS (what fires on true anomalies):
+  IQR_sig + IF + LOF      75 (19.9%)   → ALERTED (HIGH)
+  IQR_any + IF + LOF      63 (16.7%)   → ALERTED (MEDIUM)
+  IQR_any + IF             63 (16.7%)   → ALERTED (MEDIUM)
+  IQR_sig + LOF            51 (13.5%)   → ALERTED (HIGH)
+  IF + LOF                 36  (9.5%)   → ALERTED (HIGH)
+  IQR_any + LOF            34  (9.0%)   → ALERTED (MEDIUM)
+  none                     31  (8.2%)   → suppressed (no signal at all)
+  IF only                  19  (5.0%)   → suppressed (no corroboration)
+  LOF only                  4  (1.1%)   → suppressed (no corroboration)
+
+FALSE POSITIVE PATTERNS (what fires on clean data):
+  IQR_any only            209           → suppressed
+  LOF only                167           → suppressed
+  IF only                 157           → suppressed
+  IF + LOF                 34           → ALERTED (FP)
+  IQR_any + IF             31           → ALERTED (FP)
+```
+
+The data shows that single-ML-predict events are **overwhelmingly false positives** (157+167 clean vs 19+4 anomalous = 93% noise). Corroboration filters this noise effectively.
+
+### The Design Choice
+
+We accepted ~6% missed anomalies to keep the FP rate under 15%. This is appropriate for a system where **alert fatigue is a bigger operational risk than missing a subtle anomaly** — an operator who ignores alerts because most are false is worse off than one who occasionally misses a marginal detection.
+
+If a future use case demands higher recall at the cost of precision, the corroboration can be relaxed:
+- **Option A:** Let single ML predictions through as LOW severity (separate triage queue)
+- **Option B:** Lower the contamination rate (e.g., 0.01) so single predictions are more selective
+- **Option C:** Add a confidence threshold — only let single ML predictions through if the percentile score exceeds 0.99
 
 ### How predict() Reduces False Positives
 
