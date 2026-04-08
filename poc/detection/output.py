@@ -113,6 +113,7 @@ def print_detections(scored_events: list[ScoredEvent]) -> int:
             event.deviating_features,
             event.if_predicts_anomaly,
             event.lof_predicts_anomaly,
+            event.mahalanobis_p_value,
         )
         if severity is None:
             row = event.telemetry_row

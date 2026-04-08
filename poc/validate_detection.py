@@ -109,7 +109,8 @@ def score_events(events: list[dict], models: dict[str, tuple]) -> dict:
         vec = trained.build_scaled_vector(features)
         if_pred = trained.model.predict(vec)[0] == -1
         lof_pred = trained.lof_model.predict(vec)[0] == -1
-        severity = determine_severity(deviations, if_pred, lof_pred)
+        mahal_p = trained.mahalanobis_p_value(features)
+        severity = determine_severity(deviations, if_pred, lof_pred, mahal_p)
 
         if severity is not None:
             if is_anomaly and tag:

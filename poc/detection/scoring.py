@@ -127,35 +127,38 @@ def determine_severity(
     deviating_features: list[FeatureDeviation],
     if_predicts_anomaly: bool,
     lof_predicts_anomaly: bool,
+    mahalanobis_p_value: float = 1.0,
 ) -> Severity | None:
     """
     Determine detection severity using corroboration between detector families.
 
-    Three independent detector families vote:
+    Four independent detector families vote:
     1. IQR (statistical, per-feature) — captured in deviating_features
     2. Isolation Forest predict() — calibrated to contamination rate
     3. LOF predict() — calibrated to contamination rate
+    4. Mahalanobis distance — p < 0.01 counts as a vote
 
     Requiring 2+ families to agree keeps the false positive rate low.
     IQR significant is trusted alone because it requires either multiple
     deviating features or extreme single-feature deviation.
     """
     iqr_significant, iqr_any = classify_iqr_signals(deviating_features)
-    ml_votes = sum([if_predicts_anomaly, lof_predicts_anomaly])
+    mahal_anomalous = mahalanobis_p_value < config.MAHALANOBIS_P_VALUE_MEDIUM
+    ml_votes = sum([if_predicts_anomaly, lof_predicts_anomaly, mahal_anomalous])
 
     # IQR significant + any ML → HIGH
     if iqr_significant and ml_votes >= 1:
         return Severity.HIGH
 
-    # Both ML models independently predict anomaly → HIGH
-    if ml_votes == 2:
+    # 2+ ML families independently agree → HIGH
+    if ml_votes >= 2:
         return Severity.HIGH
 
     # IQR significant alone → MEDIUM
     if iqr_significant:
         return Severity.MEDIUM
 
-    # IQR any (hard) + one ML predict → MEDIUM (corroboration)
+    # IQR any (hard) + one ML vote → MEDIUM (corroboration)
     if iqr_any and ml_votes >= 1:
         return Severity.MEDIUM
 
