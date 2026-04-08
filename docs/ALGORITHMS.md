@@ -370,13 +370,13 @@ Standard Euclidean distance treats all directions equally. But in real data, fea
 
 - **Assumes multivariate normality:** Real data (especially boolean features) isn't normally distributed. This weakens the p-value interpretation.
 - **Sensitive to covariance estimation:** With more features than samples, the covariance matrix becomes ill-conditioned. We add regularization (small diagonal term) to prevent this.
-- **Diagnostic-only in our system:** Due to the normality limitation, Mahalanobis does **not** participate in severity voting. It is computed and displayed in alert panels as supplementary context for the operator (the p-value helps assess how statistically unusual the configuration is), but it does not trigger or suppress alerts. The three voting detectors are IQR, IF, and LOF.
+- **Votes via p-value threshold:** Despite the normality limitation, empirical testing showed Mahalanobis has excellent separation: 77.8% of anomalies have p < 0.001 vs only 0.6% of clean data. A p-value below 0.01 counts as one vote in the severity corroboration system (same weight as IF predict or LOF predict). This brought detection from 88% to 90%.
 
 ---
 
 ## 8. How We Combine Them — Ensemble Voting
 
-No single algorithm is perfect. IQR catches single-feature outliers but misses correlations. IF catches complex patterns but can produce noisy scores. LOF captures local structure. By combining their **severity votes**, we get the strengths of all three while mitigating individual weaknesses. (Mahalanobis distance is computed and displayed for diagnostic context but does not participate in severity voting — see Section 7.)
+No single algorithm is perfect. IQR catches single-feature outliers but misses correlations. IF catches complex patterns but can produce noisy scores. LOF captures local structure. Mahalanobis catches covariance-level deviations. By combining their **severity votes**, we get the strengths of all four while mitigating individual weaknesses.
 
 ### The Corroboration Principle — And Its Cost
 
@@ -450,11 +450,13 @@ This gives us a structural FP guarantee: **requiring both ML models to agree lim
 ### Severity Voting Rules
 
 ```
-HIGH:   IQR significant + any ML predict
-        OR both IF and LOF predict anomaly
+ML vote = IF predict() OR LOF predict() OR Mahalanobis p < 0.01
+
+HIGH:   IQR significant + any ML vote
+        OR 2+ ML votes agree
 
 MEDIUM: IQR significant alone (strong per-feature evidence)
-        OR IQR any + one ML predict (corroboration)
+        OR IQR any + one ML vote (corroboration)
 
 (none): Everything else — not reported
 ```
@@ -563,7 +565,7 @@ Baselines are not static. As new telemetry arrives:
 | **SHAP** | SHapley Additive exPlanations — a method to explain which features contributed to a model's prediction. |
 | **Contamination** | The expected fraction of anomalies in training data. Controls how aggressively models flag outliers. |
 | **Feature vector** | A flat list of numbers extracted from a raw configuration snapshot, suitable for mathematical algorithms. |
-| **Baseline** | A statistical model of "normal" behavior, learned from historical data. Includes IQR fences, IF model, LOF model, and Mahalanobis parameters (diagnostic only). |
+| **Baseline** | A statistical model of "normal" behavior, learned from historical data. Includes IQR fences, IF model, LOF model, and Mahalanobis parameters. |
 | **Percentile scoring** | Converting a raw algorithm score to a 0–1 scale based on how it ranks against training data scores. |
 | **Corroboration** | The requirement that multiple independent detectors agree before issuing an alert. Reduces false positives. |
 | **Cold start** | The period when a new implant has insufficient history for a per-implant baseline. |

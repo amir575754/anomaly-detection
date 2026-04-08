@@ -35,9 +35,9 @@ This proof-of-concept demonstrates an **autonomous anomaly detection platform** 
 
 | Metric | Achieved | Target |
 |---|---|---|
-| Detection rate (true anomalies caught) | **88.0%** | >70% |
-| False positive rate (false alerts / total alerts) | **22.7%** | <40% |
-| Precision (true alerts / total alerts) | **77.3%** | — |
+| Detection rate (true anomalies caught) | **90.0%** | >70% |
+| False positive rate (false alerts / total alerts) | **23.6%** | <40% |
+| Precision (true alerts / total alerts) | **76.4%** | — |
 | Per-injector detection (10 of 10 types) | **60–100%** | — |
 
 ### What the Demo Shows
@@ -391,14 +391,14 @@ Operational implants use a single persistence method. Features capture the metho
 
 ### Detection Ensemble
 
-Each telemetry event is scored by three voting detectors plus one diagnostic measure:
+Each telemetry event is scored by four voting detectors:
 
 | Detector | Type | Catches | FP Characteristics |
 |---|---|---|---|
 | **IQR Fences** | Statistical, per-feature | Single-feature outliers, extreme deviations | Low FP (data-driven fences), interpretable |
 | **Isolation Forest** | Tree-based, multivariate | Complex multi-feature patterns, correlation violations | Moderate FP without corroboration, calibrated via contamination |
 | **Local Outlier Factor** | Density-based, multivariate | Local manifold deviations, cluster-edge anomalies | Moderate FP without corroboration |
-| **Mahalanobis Distance** | Parametric, covariance-aware (diagnostic only — does not vote on severity) | Displayed in alert panels for operator context | Principled p-values, but assumes normality; shown for diagnostics, not used in severity logic |
+| **Mahalanobis Distance** | Parametric, covariance-aware | Deviations from multivariate center (p < 0.01 = one vote) | Principled p-values; despite normality assumption, 77.8% of anomalies have p < 0.001 vs 0.6% of clean data |
 
 ### The Corroboration Requirement
 
@@ -593,13 +593,13 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 | Metric | Value |
 |---|---|
-| **Detection rate** | 88.0% |
-| **False positive rate** | 22.7% |
-| **Precision** | 77.3% |
+| **Detection rate** | 90.0% |
+| **False positive rate** | 23.6% |
+| **Precision** | 76.4% |
 | Events scored | 5,000 |
 | Anomalies injected | ~209 |
-| True positives | 184 |
-| False positives | 54 |
+| True positives | 188 |
+| False positives | 58 |
 
 ### Per-Injector Breakdown
 
@@ -611,8 +611,8 @@ The PoC uses synthetic data with controlled anomaly injection:
 | persistence_spike | 25 | 25 | **100%** |
 | forgotten_operation_teardown | 15 | 15 | **100%** |
 | wrong_comm_profile | 22 | 22 | **100%** |
-| duplicated_persistence_setup | 23 | 20 | **87%** |
-| mismatched_escalation_policy | 21 | 18 | **86%** |
+| duplicated_persistence_setup | 23 | 23 | **100%** |
+| mismatched_escalation_policy | 21 | 19 | **90%** |
 | full_evasion | 33 | 22 | **67%** |
 | self_destruct_flood | 20 | 12 | **60%** |
 
@@ -715,11 +715,11 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 ### 1. Autonomous Detection Is Viable
 
-The system detects all 10 anomaly types at 60-100% without any hand-written rules. It learned what "normal" looks like from 10 days of synthetic history and immediately began flagging deviations.
+The system detects all 10 anomaly types at 60-100% (90% overall) without any hand-written rules. It learned what "normal" looks like from 10 days of synthetic history and immediately began flagging deviations.
 
 ### 2. False Positive Rate Is Controllable
 
-At 22.7% FP rate (77.3% precision), the alert stream is readable. The corroboration requirement between detector families is the key mechanism — it provides structural FP control independent of threshold tuning.
+At 23.6% FP rate (76.4% precision), the alert stream is readable. The corroboration requirement between detector families is the key mechanism — it provides structural FP control independent of threshold tuning.
 
 ### 3. Multi-Algorithm Ensemble Provides Robustness
 
