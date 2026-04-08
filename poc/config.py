@@ -161,7 +161,7 @@ INGESTOR_WAIT_TIMEOUT_SECONDS: int = 300
 INGESTOR_BATCH_SIZE: int = 500
 
 # Kafka consumer poll timeout in seconds — how long to wait for a message before checking batch
-KAFKA_POLL_TIMEOUT_SECONDS: float = 0.5
+KAFKA_POLL_TIMEOUT_SECONDS: float = 0.05
 
 # Number of processed messages between progress log lines
 INGESTOR_LOG_INTERVAL_MESSAGES: int = 2000
