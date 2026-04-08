@@ -77,26 +77,47 @@ def _build_panel(event: ScoredEvent, severity: Severity) -> Panel:
     iqr_table = _build_iqr_table(event)
     shap_table = _build_shap_table(event)
 
+    from detection.scoring import classify_iqr_signals
+    iqr_significant, _iqr_any = classify_iqr_signals(event.deviating_features)
+    iqr_label = "FLAGGED" if iqr_significant else "FLAGGED (weak)" if event.deviating_features else "ok"
+    iqr_label_color = "red" if event.deviating_features else "dim"
+
     parts: list[Text | Table] = []
     if iqr_table is not None:
-        parts.append(Text("IQR Deviations:", style="bold underline"))
+        iqr_header = Text()
+        iqr_header.append("IQR Deviations ", style="bold underline")
+        iqr_header.append(f"[{iqr_label}]", style=iqr_label_color)
+        parts.append(iqr_header)
         parts.append(iqr_table)
     if shap_table is not None:
         parts.append(Text("SHAP Contributions:", style="bold underline"))
         parts.append(shap_table)
 
     scores_text = Text()
+
+    if_flag = "FLAGGED" if event.if_predicts_anomaly else "ok"
+    if_color = "red" if event.if_predicts_anomaly else "dim"
     scores_text.append("IF: ", style="bold")
-    scores_text.append(f"{event.isolation_forest_score:.3f}", style="bold magenta")
+    scores_text.append(f"{event.isolation_forest_score:.3f} ", style="bold magenta")
+    scores_text.append(f"[{if_flag}]", style=if_color)
+
+    lof_flag = "FLAGGED" if event.lof_predicts_anomaly else "ok"
+    lof_color = "red" if event.lof_predicts_anomaly else "dim"
     scores_text.append("  LOF: ", style="bold")
-    scores_text.append(f"{event.lof_score:.3f}", style="bold magenta")
-    scores_text.append("  Mahal p: ", style="bold")
+    scores_text.append(f"{event.lof_score:.3f} ", style="bold magenta")
+    scores_text.append(f"[{lof_flag}]", style=lof_color)
+
+    mahal_flagged = event.mahalanobis_p_value < config.MAHALANOBIS_P_VALUE_MEDIUM
+    mahal_flag = "FLAGGED" if mahal_flagged else "ok"
     p_color = (
         "red" if event.mahalanobis_p_value < config.MAHALANOBIS_P_VALUE_HIGH
-        else "yellow" if event.mahalanobis_p_value < config.MAHALANOBIS_P_VALUE_MEDIUM
-        else "green"
+        else "yellow" if mahal_flagged
+        else "dim"
     )
-    scores_text.append(f"{event.mahalanobis_p_value:.1e}", style=f"bold {p_color}")
+    scores_text.append("  Mahal p: ", style="bold")
+    scores_text.append(f"{event.mahalanobis_p_value:.1e} ", style=f"bold {p_color}")
+    scores_text.append(f"[{mahal_flag}]", style=p_color)
+
     parts.append(scores_text)
     panel_body = Group(*parts)
 
