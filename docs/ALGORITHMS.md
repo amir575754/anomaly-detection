@@ -524,6 +524,24 @@ When a new implant appears, there's no per-implant history to build a baseline f
 
 During the cold-start period, the group baseline handles detection. Once enough per-implant data exists, the per-implant baseline takes precedence — it's more tailored to the individual implant's normal behavior.
 
+### Group vs Per-Implant — Measured Tradeoff
+
+| Metric | Group | Per-Implant |
+|---|---|---|
+| Detection rate | 82.3% | **86.0%** |
+| FP rate | **21.9%** | 44.3% |
+
+Per-implant baselines are more sensitive (they catch anomalies the group model misses) but noisier (more false positives). The noise is directly caused by **sample count** — per-implant windows have fewer training samples than group windows:
+
+| Samples per implant | Detection | FP rate |
+|---|---|---|
+| 70 | 86.7% | 43.8% |
+| 150 | 80.1% | 40.5% |
+| **300 (configured)** | **82.2%** | **22.5%** |
+| 500 | 78.0% | 21.2% |
+
+300 samples is the sweet spot — FP drops from 44% to 22% while detection holds at 82%. The system is configured to use 300-sample implant windows, but at 24 snapshots/day per implant, it takes ~60 days to fill a window for a given config type. Early per-implant baselines will be noisier and will improve over time.
+
 ### Retraining
 
 Baselines are not static. As new telemetry arrives:

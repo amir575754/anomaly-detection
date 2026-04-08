@@ -471,6 +471,31 @@ The detector monitors a **write counter** per window. When 100+ new vectors have
 
 This means baselines adapt to gradual behavioral drift without manual intervention.
 
+### Measured Performance by Scope
+
+| Metric | Group Baseline | Per-Implant Baseline |
+|---|---|---|
+| **Detection rate** | 82.3% | **86.0%** |
+| **FP rate** | **21.9%** | 44.3% |
+| **Precision** | **78.1%** | 55.7% |
+
+Per-implant baselines catch more anomalies (+4%) because they learn tighter, individual-specific norms. The biggest gain is `duplicated_persistence_setup` (44% → 94%) — when the model knows *this implant* always uses `scheduled_task`, seeing `registry_run` with wrong infrastructure is much more obvious than when the group model has seen all method types.
+
+However, per-implant baselines have much higher FP rates because with fewer training samples the models are noisier. This is directly tied to sample count:
+
+### Effect of Training Sample Size (Per-Implant)
+
+| Samples per implant | Detection | FP rate | Precision |
+|---|---|---|---|
+| 70 | 86.7% | 43.8% | 56.2% |
+| 150 | 80.1% | 40.5% | 59.5% |
+| **300** | **82.2%** | **22.5%** | **77.5%** |
+| 500 | 78.0% | 21.2% | 78.8% |
+
+**300 samples is the sweet spot** — FP rate drops from 44% to 22% while detection stays at 82%. Going to 500 gives diminishing returns and detection actually decreases as the models overfit to a very stable baseline. This is why `BASELINE_WINDOW_SIZE_IMPLANT` is set to 300.
+
+**Practical implication:** With 24 snapshots/implant/day and ~20% being any given config type, it takes approximately 60 days to fill a 300-sample window for one config type. The `IMPLANT_BASELINE_MIN_DAYS = 7` threshold activates per-implant baselines with ~34 samples — well below the optimal 300. Early per-implant baselines will be noisier (closer to the 70-sample FP rate) and will improve over time as the window fills.
+
 ---
 
 ## 10. Severity Classification and Alert Design
