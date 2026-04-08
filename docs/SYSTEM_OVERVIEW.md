@@ -294,69 +294,88 @@ Features capture **operational semantics** — the meaning of a configuration in
 
 #### Communication Configuration (12 features)
 
-| Feature | Type | Captures |
+| Feature | Type | Description |
 |---|---|---|
-| `beacon_interval_ms` | Raw | Primary timing parameter |
-| `jitter_percentage` | Raw | Timing randomization |
-| `max_retries` | Raw | Failure resilience |
-| `sleep_on_failure_ms` | Raw | Failure backoff duration |
-| `key_rotation_hours` | Raw | Cryptographic freshness |
-| `c2_channel_count` | Count | Infrastructure breadth |
-| `c2_enabled_count` | Count | Active infrastructure |
-| `c2_unique_protocols` | Count | Protocol diversity |
-| `c2_non_standard_ports` | Count | Network stealth |
-| `beacon_to_sleep_ratio` | Interaction | Beacon vs recovery timing correlation |
-| `beacon_to_rotation_ratio` | Interaction | Beacon vs crypto rotation correlation |
-| `jitter_retries_product` | Interaction | Randomization x resilience relationship |
+| `beacon_interval_ms` | Raw | Milliseconds between implant beacons; higher = stealthier |
+| `jitter_percentage` | Raw | Randomization on beacon timing (0.0 = predictable, 1.0 = fully random) |
+| `max_retries` | Raw | Connection retry count before sleeping on failure |
+| `sleep_on_failure_ms` | Raw | Backoff duration in ms after retries exhausted |
+| `key_rotation_hours` | Raw | Encryption key rotation frequency in hours |
+| `c2_channel_count` | Count | Total C2 channels configured (active + inactive) |
+| `c2_enabled_count` | Count | Currently active C2 channels |
+| `c2_unique_protocols` | Count | Distinct protocols across channels (https, dns, smb, etc.) |
+| `c2_non_standard_ports` | Count | Channels on ports other than 80/443/53 — more likely flagged by network monitoring |
+| `beacon_to_sleep_ratio` | Interaction | `beacon_interval_ms / sleep_on_failure_ms` — stable in baseline because both are driven by the beacon parameter |
+| `beacon_to_rotation_ratio` | Interaction | `beacon_interval_ms / key_rotation_hours` — ties beacon timing to crypto freshness |
+| `jitter_retries_product` | Interaction | `jitter_percentage * max_retries` — captures the randomization-resilience interaction |
 
 **Correlated generation:** The synthetic generator ties jitter, retries, sleep, and key rotation to a normalized beacon interval. This creates a manifold of valid configurations. Anomalies that draw features independently (like `wrong_comm_profile`) land off this manifold.
 
 #### Dangerous Program Configuration (15 features)
 
-| Feature | Type | Captures |
+| Feature | Type | Description |
 |---|---|---|
-| `program_count`, `driver_count`, `total_entries` | Count | Configuration size |
-| `prog_audit_count`, `prog_self_destruct_count`, `prog_do_nothing_count` | Count | Per-category action distribution (programs) |
-| `drv_audit_count`, `drv_self_destruct_count`, `drv_do_nothing_count` | Count | Per-category action distribution (drivers) |
-| `overall_audit_ratio`, `overall_self_destruct_ratio`, `overall_do_nothing_ratio` | Ratio | Global action balance |
-| `posture_consistency` | Derived | L1 similarity between program and driver action distributions |
-| `action_diversity` | Count | Number of distinct actions present |
-| `dominant_action_ratio` | Ratio | Fraction of the most common action |
+| `program_count` | Count | Number of dangerous programs in the watchlist |
+| `driver_count` | Count | Number of dangerous drivers in the watchlist |
+| `total_entries` | Count | `program_count + driver_count` — overall watchlist size |
+| `prog_audit_count` | Count | Programs set to "audit" (monitor only) |
+| `prog_self_destruct_count` | Count | Programs set to "self_destruct" (wipe implant if detected) |
+| `prog_do_nothing_count` | Count | Programs set to "do_nothing" (ignore if detected) |
+| `drv_audit_count` | Count | Drivers set to "audit" |
+| `drv_self_destruct_count` | Count | Drivers set to "self_destruct" |
+| `drv_do_nothing_count` | Count | Drivers set to "do_nothing" |
+| `overall_audit_ratio` | Ratio | Fraction of all entries set to "audit" |
+| `overall_self_destruct_ratio` | Ratio | Fraction of all entries set to "self_destruct" |
+| `overall_do_nothing_ratio` | Ratio | Fraction of all entries set to "do_nothing" |
+| `posture_consistency` | Derived | L1 similarity between program and driver action distributions (1.0 = identical, 0.0 = opposite) |
+| `action_diversity` | Count | Distinct actions present (1 = all same action, 3 = all three used) |
+| `dominant_action_ratio` | Ratio | Fraction of entries assigned to the most common action |
 
 #### Persistence Configuration (7 features)
 
-| Feature | Type | Captures |
+| Feature | Type | Description |
 |---|---|---|
-| `active_method_count` | Count | Persistence depth |
-| `registry_key_count`, `scheduled_task_count` | Count | Per-mechanism footprint |
-| `watchdog_enabled`, `reinstall_on_removal` | Binary | Safety net presence |
-| `total_persistence_footprint` | Sum | Overall persistence weight |
-| `safety_to_depth_ratio` | Ratio | Safety infrastructure per method |
+| `active_method_count` | Count | Active persistence methods (registry_run, scheduled_task, etc.) — drives "depth" |
+| `registry_key_count` | Count | Registry keys used; correlates with method count in baseline |
+| `scheduled_task_count` | Count | Scheduled tasks created; correlates with method count in baseline |
+| `watchdog_enabled` | Binary | 1.0 if a watchdog monitors persistence health — normally only at high depth |
+| `reinstall_on_removal` | Binary | 1.0 if auto-reinstall on removal — normally only at high depth |
+| `total_persistence_footprint` | Sum | `method_count + registry_keys + scheduled_tasks` — overall persistence weight |
+| `safety_to_depth_ratio` | Ratio | `(watchdog + reinstall) / method_count` — safety infrastructure per method; anomalous when high safety wraps low depth |
 
 **Correlated generation:** Method count drives registry/task counts and safety net probabilities via depth-dependent lookup tables. `duplicated_persistence_setup` violates this by pairing depth-1 methods with depth-3 safety infrastructure.
 
 #### Capability Configuration (9 features)
 
-| Feature | Type | Captures |
+| Feature | Type | Description |
 |---|---|---|
-| `enabled_count`, `enabled_ratio` | Count/Ratio | How much capability is active |
-| `max_concurrent_tasks`, `task_timeout_ms` | Raw | Resource allocation |
-| `active_surveillance_count`, `non_surveillance_enabled_count` | Count | Capability type breakdown |
-| `resource_per_capability` | Ratio | Resources per enabled capability |
-| `surveillance_ratio` | Ratio | Surveillance proportion of total |
-| `concurrency_timeout_product` | Interaction | Resource x timeout relationship |
+| `enabled_count` | Count | Number of enabled capabilities (out of 8 total) |
+| `enabled_ratio` | Ratio | `enabled_count / 8` — fraction of total capabilities active |
+| `max_concurrent_tasks` | Raw | Maximum simultaneous capability executions — higher = more aggressive posture |
+| `task_timeout_ms` | Raw | Milliseconds before a task is killed — short = aggressive, long = passive |
+| `active_surveillance_count` | Count | Enabled surveillance capabilities (keylogging, screenshot) |
+| `non_surveillance_enabled_count` | Count | `enabled_count - surveillance_count` — non-surveillance capabilities |
+| `resource_per_capability` | Ratio | `max_concurrent_tasks / enabled_count` — execution slots per capability |
+| `surveillance_ratio` | Ratio | `surveillance_count / enabled_count` — what fraction of activity is surveillance |
+| `concurrency_timeout_product` | Interaction | `max_tasks * timeout_ms / 1000` — total resource commitment; stays in a narrow band because high concurrency pairs with short timeouts and vice versa |
 
 **Two-cluster structure:** The generator creates surveillance posture (high surveillance, high concurrency, low timeout) and passive posture (low surveillance, low concurrency, high timeout). `forgotten_operation_teardown` mixes them.
 
 #### Evasion Configuration (11 features)
 
-| Feature | Type | Captures |
+| Feature | Type | Description |
 |---|---|---|
-| `evasion_enabled_count`, `evasion_enabled_ratio` | Count/Ratio | How many techniques are active |
-| `evasion_layer_depth` | Derived | Highest dependency layer with active techniques |
-| `dependency_coherence` | Derived | Fraction of techniques whose prerequisites are met |
-| `depth_per_enabled` | Ratio | Layer depth per active technique |
-| `obfuscate_strings` through `stack_spoof` | Binary | Individual technique states |
+| `evasion_enabled_count` | Count | Number of evasion techniques enabled (out of 6) |
+| `evasion_enabled_ratio` | Ratio | `enabled_count / 6` — fraction of techniques active |
+| `evasion_layer_depth` | Derived | Highest active dependency layer (0–3); layer 3 = advanced techniques |
+| `dependency_coherence` | Derived | Fraction of enabled techniques whose prerequisites are also enabled (1.0 = normal) |
+| `depth_per_enabled` | Ratio | `layer_depth / enabled_count` — exceeds 1.0 only when advanced techniques are on without foundations |
+| `obfuscate_strings` | Binary | Layer 1 — string obfuscation, foundation of the evasion chain |
+| `amsi_bypass_enabled` | Binary | Layer 2 — AMSI bypass, depends on obfuscate_strings |
+| `etw_patch_enabled` | Binary | Layer 2 — ETW patching, independent of AMSI |
+| `unhook_ntdll` | Binary | Layer 2 — ntdll unhooking, depends on etw_patch_enabled |
+| `sleep_obfuscation` | Binary | Layer 3 — hides implant during sleep, depends on layer-2 techniques |
+| `stack_spoof` | Binary | Layer 3 — call stack spoofing, depends on sleep_obfuscation; rarest technique (~15%) |
 
 **Layered dependency chain:** The generator maintains a dependency structure (layer 1, 2, 3). Higher-layer techniques are rarely enabled without lower-layer prerequisites. `full_evasion` breaks this chain.
 

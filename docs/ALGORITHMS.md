@@ -76,15 +76,88 @@ Our features are designed to measure general operational properties:
 
 If our features started encoding specific anomaly signatures (like "is_all_self_destruct"), we'd be doing rule-based detection disguised as ML — defeating the purpose of unsupervised learning.
 
-### Feature Categories Per Configuration Type
+### Feature Catalogue
 
-| Configuration Type | Feature Count | Key Features |
+Below is every feature the system extracts, grouped by configuration type. Each feature is a single floating-point number. All features are passed through `StandardScaler` (mean=0, std=1) before reaching the ML models (IF, LOF, SHAP). IQR operates on the raw values by design.
+
+#### Communication Configuration (12 features)
+
+| Feature | Description | Typical Range |
 |---|---|---|
-| **Communication** | 12 | beacon_interval_ms, jitter_percentage, beacon_to_sleep_ratio, jitter_retries_product, c2_channel_count |
-| **Dangerous Program** | 15 | program_count, per-action counts and ratios, posture_consistency, action_diversity, dominant_action_ratio |
-| **Persistence** | 7 | active_method_count, registry_key_count, safety_to_depth_ratio, total_persistence_footprint |
-| **Capability** | 9 | enabled_count, surveillance_ratio, resource_per_capability, concurrency_timeout_product |
-| **Evasion** | 11 | evasion_enabled_count, dependency_coherence, depth_per_enabled, individual boolean flags |
+| `beacon_interval_ms` | Milliseconds between beacons sent by the implant. The primary timing parameter — higher values are stealthier. | 25,000 – 35,000 |
+| `jitter_percentage` | Randomization applied to the beacon interval (0.0 = perfectly predictable, 1.0 = fully random). Defenders look for predictable intervals. | 0.10 – 0.25 |
+| `max_retries` | How many times the implant retries a failed C2 connection before sleeping. | 3 – 7 |
+| `sleep_on_failure_ms` | Backoff duration in milliseconds after all retries are exhausted. | 5,000 – 15,000 |
+| `key_rotation_hours` | How frequently the encryption key is rotated. Lower = more secure but more traffic. | 12 – 48 |
+| `c2_channel_count` | Total number of C2 channels configured (active + inactive). | 1 – 3 |
+| `c2_enabled_count` | How many of those C2 channels are currently enabled. | 0 – 3 |
+| `c2_unique_protocols` | Number of distinct protocols across all channels (https, dns, smb, etc.). | 1 – 3 |
+| `c2_non_standard_ports` | Count of channels using ports other than 80, 443, or 53. Non-standard ports are more likely to be flagged by network monitoring. | 0 – 3 |
+| `beacon_to_sleep_ratio` | `beacon_interval_ms / sleep_on_failure_ms`. Captures the operational relationship between normal timing and failure recovery. In baseline data this ratio is stable because both are driven by the same beacon parameter. | 2.0 – 5.5 |
+| `beacon_to_rotation_ratio` | `beacon_interval_ms / key_rotation_hours`. Captures how beacon timing relates to cryptographic freshness. | 700 – 2,300 |
+| `jitter_retries_product` | `jitter_percentage * max_retries`. Captures the interaction between randomization and resilience — high jitter with high retries means a very different failure profile than low jitter with low retries. | 0.5 – 1.3 |
+
+#### Dangerous Program Configuration (15 features)
+
+| Feature | Description | Typical Range |
+|---|---|---|
+| `program_count` | Number of dangerous programs in the watchlist (e.g., wireshark.exe, procmon.exe). | 2 – 5 |
+| `driver_count` | Number of dangerous drivers in the watchlist (e.g., WdFilter.sys, csagent.sys). | 1 – 4 |
+| `total_entries` | `program_count + driver_count`. Overall watchlist size. | 3 – 9 |
+| `prog_audit_count` | Programs with action set to "audit" (monitor but don't react). | 0 – 5 |
+| `prog_self_destruct_count` | Programs with action set to "self_destruct" (wipe the implant if detected). | 0 – 5 |
+| `prog_do_nothing_count` | Programs with action set to "do_nothing" (ignore even if detected). | 0 – 5 |
+| `drv_audit_count` | Drivers with action set to "audit". | 0 – 4 |
+| `drv_self_destruct_count` | Drivers with action set to "self_destruct". | 0 – 4 |
+| `drv_do_nothing_count` | Drivers with action set to "do_nothing". | 0 – 4 |
+| `overall_audit_ratio` | Fraction of all entries (programs + drivers) set to "audit". | 0.0 – 1.0 |
+| `overall_self_destruct_ratio` | Fraction of all entries set to "self_destruct". | 0.0 – 1.0 |
+| `overall_do_nothing_ratio` | Fraction of all entries set to "do_nothing". | 0.0 – 1.0 |
+| `posture_consistency` | L1 similarity between the program action distribution and the driver action distribution. Returns 1.0 when both groups have identical ratios, 0.0 when completely opposite. In normal operations, programs and drivers share the same dominant action (e.g., both mostly "audit"). | 0.0 – 1.0 |
+| `action_diversity` | Number of distinct actions present across all entries. Normal configs have 2–3 distinct actions; a value of 1 means every entry has the same action. | 1 – 3 |
+| `dominant_action_ratio` | Fraction of all entries assigned to the most common action. Higher values mean a more uniform (less diverse) policy. | 0.33 – 1.0 |
+
+#### Persistence Configuration (7 features)
+
+| Feature | Description | Typical Range |
+|---|---|---|
+| `active_method_count` | Number of active persistence methods (registry_run, scheduled_task, service_install, etc.). Drives the "depth" of persistence. | 1 – 3 |
+| `registry_key_count` | Number of registry keys used for persistence. In baseline data, this correlates with `active_method_count` — more methods need more keys. | 1 – 5 |
+| `scheduled_task_count` | Number of scheduled tasks created for persistence. Like registry keys, correlates with depth. | 0 – 3 |
+| `watchdog_enabled` | 1.0 if a watchdog process monitors persistence health, 0.0 otherwise. Normally only enabled at high depth (3 methods). | 0 or 1 |
+| `reinstall_on_removal` | 1.0 if the implant reinstalls itself when persistence is removed, 0.0 otherwise. Like watchdog, correlates with depth. | 0 or 1 |
+| `total_persistence_footprint` | `active_method_count + registry_key_count + scheduled_task_count`. A single number capturing overall persistence weight on the host. | 2 – 11 |
+| `safety_to_depth_ratio` | `(watchdog_enabled + reinstall_on_removal) / active_method_count`. Measures how much safety infrastructure exists per persistence method. In baseline data, deep persistence (3 methods) has high safety (ratio ~0.5–0.7), while shallow persistence (1 method) has low safety (ratio ~0.0). The `duplicated_persistence_setup` anomaly violates this: 1 method with both safety nets enabled (ratio = 2.0). | 0.0 – 1.0 |
+
+#### Capability Configuration (9 features)
+
+| Feature | Description | Typical Range |
+|---|---|---|
+| `enabled_count` | Number of capabilities currently enabled (out of 8 total: file_exfiltration, keylogging, screenshot, process_injection, lateral_movement, credential_harvesting, persistence, network_scan). | 0 – 7 |
+| `enabled_ratio` | `enabled_count / 8`. Fraction of total capabilities that are active. | 0.0 – 0.88 |
+| `max_concurrent_tasks` | Maximum number of capabilities that can execute simultaneously. Higher values indicate an active operational posture. | 2 – 6 |
+| `task_timeout_ms` | Milliseconds before a capability task is killed for taking too long. Short timeouts = active/aggressive posture; long timeouts = passive/patient posture. | 30,000 – 120,000 |
+| `active_surveillance_count` | Number of enabled surveillance-specific capabilities (keylogging, screenshot). These are the most operationally sensitive capabilities. | 0 – 2 |
+| `non_surveillance_enabled_count` | `enabled_count - active_surveillance_count`. Enabled capabilities that are NOT surveillance. | 0 – 6 |
+| `resource_per_capability` | `max_concurrent_tasks / enabled_count`. How many execution slots exist per enabled capability. Low values mean capabilities are competing for resources. | 0.3 – 2.0 |
+| `surveillance_ratio` | `active_surveillance_count / enabled_count`. What fraction of enabled capabilities are surveillance. The `forgotten_operation_teardown` anomaly produces a high surveillance ratio paired with passive resource settings — a contradiction. | 0.0 – 1.0 |
+| `concurrency_timeout_product` | `max_concurrent_tasks * task_timeout_ms / 1000`. Captures the overall resource commitment — high concurrency with long timeouts means the implant is dedicating significant host resources. In baseline data, surveillance posture has high concurrency + short timeouts, while passive posture has low concurrency + long timeouts, so this product stays in a narrow band. | 60 – 480 |
+
+#### Evasion Configuration (11 features)
+
+| Feature | Description | Typical Range |
+|---|---|---|
+| `evasion_enabled_count` | Number of evasion techniques currently enabled (out of 6). | 0 – 6 |
+| `evasion_enabled_ratio` | `evasion_enabled_count / 6`. Fraction of available techniques that are active. | 0.0 – 1.0 |
+| `evasion_layer_depth` | The highest dependency layer with any enabled technique (0–3). Layer 1 = basic (obfuscate_strings), Layer 2 = intermediate (AMSI bypass, ETW patch, unhook), Layer 3 = advanced (sleep obfuscation, stack spoofing). | 0 – 3 |
+| `dependency_coherence` | Fraction of enabled techniques whose prerequisites are also enabled. Returns 1.0 when all dependency chains are satisfied (normal). Lower values indicate broken chains — techniques enabled without their foundations. The `full_evasion` anomaly breaks all dependencies, producing coherence near 0. | 0.0 – 1.0 |
+| `depth_per_enabled` | `evasion_layer_depth / evasion_enabled_count`. In baseline data, reaching layer 3 requires at least 3 enabled techniques (the prerequisites), so this ratio stays at or below 1.0. The `full_evasion` anomaly has depth=3 with count=1, producing a ratio of 3.0. | 0.0 – 3.0 |
+| `obfuscate_strings` | 1.0 if string obfuscation is enabled, 0.0 otherwise. Layer 1 — the foundation of the evasion chain. | 0 or 1 |
+| `amsi_bypass_enabled` | 1.0 if AMSI (Antimalware Scan Interface) bypass is enabled. Layer 2 — depends on obfuscate_strings. | 0 or 1 |
+| `etw_patch_enabled` | 1.0 if ETW (Event Tracing for Windows) patching is enabled. Layer 2 — independent of AMSI but same tier. | 0 or 1 |
+| `unhook_ntdll` | 1.0 if ntdll unhooking is enabled (removes security product hooks from system DLLs). Layer 2 — depends on etw_patch_enabled. | 0 or 1 |
+| `sleep_obfuscation` | 1.0 if sleep obfuscation is enabled (hides the implant during sleep periods). Layer 3 — depends on at least one layer-2 technique. | 0 or 1 |
+| `stack_spoof` | 1.0 if call stack spoofing is enabled (masks the implant's call stack). Layer 3 — depends on sleep_obfuscation. The rarest technique in baseline data (~15% enabled). | 0 or 1 |
 
 ---
 
