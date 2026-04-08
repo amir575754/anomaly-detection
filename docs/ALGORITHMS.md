@@ -221,8 +221,10 @@ Imagine you've recorded the beacon interval for 1000 past snapshots. Most values
 
 ### Example
 
+IQR operates on **raw, unscaled feature values** — not the StandardScaler-normalized values used by the ML models. This is correct by design: IQR computes percentiles per-feature independently, so the absolute scale of a feature doesn't affect other features' fences. There is no cross-feature distance calculation where scale mismatch would cause problems.
+
 ```
-Feature: beacon_interval_ms
+Feature: beacon_interval_ms (raw milliseconds, not scaled)
 Training: Q1=27000, Q3=33000, IQR=6000
 Fences: [27000 - 2×6000, 33000 + 2×6000] = [15000, 45000]
 
