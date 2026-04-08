@@ -350,27 +350,53 @@ LOF excels at detecting points that are unusual *relative to their neighborhood*
 
 ### The Intuition
 
-Mahalanobis distance asks: **"How far is this point from the center of the training distribution, accounting for correlations between features?"**
+Mahalanobis distance asks: **"How far is this configuration from what's normal, taking into account that some features move together?"**
 
-Standard Euclidean distance treats all directions equally. But in real data, features are correlated. If beacon_interval and sleep_on_failure are highly correlated (high beacon → high sleep), then a point with high beacon but low sleep is unusual — even if each value individually is within range. Euclidean distance might miss this, but Mahalanobis "stretches" the space according to the correlation structure.
+To understand why this matters, consider a simple example with two features: `beacon_interval_ms` and `sleep_on_failure_ms`. In our baseline data, these are **correlated** — when one goes up, the other tends to go up too (the generator derives both from the same internal parameter). If you plot hundreds of normal configs, they form an elongated oval (not a circle):
+
+```
+sleep_on_failure_ms
+     15000 |         . . .
+           |       . . . . .
+     10000 |     . . X . . . .       X = average config
+           |       . . . . .
+      5000 |         . . .
+           +---+---+---+---+---
+            25k  28k  30k  33k  35k
+                beacon_interval_ms
+```
+
+Now consider two incoming configs, both the same straight-line distance from the center:
+
+- **Config A:** beacon=35,000 + sleep=15,000 — high beacon AND high sleep. This **follows the pattern** (upper-right along the oval). It's at the edge of normal but in a direction the data naturally stretches.
+- **Config B:** beacon=35,000 + sleep=5,000 — high beacon BUT low sleep. This **breaks the pattern** (it's off the side of the oval, in a direction the data never goes).
+
+A simple distance measurement (like Euclidean — see Section 6) treats both the same. Mahalanobis knows Config B is far more suspicious because it measures distance **relative to the oval's shape** — distances along the oval's natural direction are treated as less unusual, while distances that cut across it (breaking the correlation) are amplified.
 
 ### How It Works
 
-1. **Compute the mean vector** (μ) — the center of the training distribution.
-2. **Compute the covariance matrix** (Σ) — captures how features vary together.
-3. **For a new point x, compute:** D² = (x - μ)ᵀ Σ⁻¹ (x - μ)
-4. **Convert to p-value:** Under a multivariate normal assumption, D² follows a chi-squared distribution with degrees of freedom equal to the number of features. A p-value < 0.001 means "there's a 0.1% chance of seeing this configuration if the data were normal."
+1. **Compute the average** of all training feature vectors — this is the center of the oval.
+2. **Compute the covariance matrix** — this captures the oval's shape: which features move together, how spread out each feature is, and how tilted the oval is.
+3. **For a new config, measure how far it is from the center** using the oval's shape as the ruler. The result is a single number: "how many oval-widths away is this point?"
+4. **Convert to a p-value** — a probability that answers: "if this config were normal, what's the chance it would be this far from the center?" A p-value of 0.001 means "only 0.1% of normal data would be this far out."
+
+Going back to our example:
+- Config A (follows the pattern): p ≈ 0.15 — 15% of normal data is this far. Not unusual.
+- Config B (breaks the pattern): p ≈ 0.001 — only 0.1% of normal data is this far. Very unusual.
+
+Same straight-line distance from center, but Mahalanobis correctly identifies that only Config B is anomalous.
 
 ### Strengths
 
-- **Principled thresholds:** p-values give statistically grounded false positive guarantees.
-- **Correlation-aware:** Catches anomalies that are normal per-feature but unusual in combination.
+- **Correlation-aware:** The main advantage over IQR (which checks features independently). Catches anomalies where each feature is individually within range but the *combination* breaks the expected pattern.
+- **Principled p-values:** The output has a clear statistical meaning ("0.1% chance of being normal") rather than an arbitrary score that needs a hand-tuned threshold.
+- **Strong empirical separation:** In our testing, 77.8% of anomalies have p < 0.001 vs only 0.6% of clean data — better discrimination than IF or LOF alone.
 
 ### Limitations
 
-- **Assumes multivariate normality:** Real data (especially boolean features) isn't normally distributed. This weakens the p-value interpretation.
-- **Sensitive to covariance estimation:** With more features than samples, the covariance matrix becomes ill-conditioned. We add regularization (small diagonal term) to prevent this.
-- **Votes via p-value threshold:** Despite the normality limitation, empirical testing showed Mahalanobis has excellent separation: 77.8% of anomalies have p < 0.001 vs only 0.6% of clean data. A p-value below 0.01 counts as one vote in the severity corroboration system (same weight as IF predict or LOF predict). This brought detection from 88% to 90%.
+- **Assumes the oval is smooth and symmetric:** The math works best when the data forms a nice, smooth elliptical cloud. Real data (especially boolean features like evasion flags) can be lumpy and asymmetric, which weakens the p-value's accuracy.
+- **Needs enough training data:** With more features than training samples, the oval shape can't be estimated reliably. We add a small correction (regularization) to prevent this from causing errors.
+- **Votes via p-value threshold:** A p-value below 0.01 counts as one vote in the severity corroboration system — same weight as an IF or LOF prediction. This brought detection from 88% to 90%.
 
 ---
 
