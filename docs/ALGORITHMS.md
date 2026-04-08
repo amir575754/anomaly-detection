@@ -271,7 +271,11 @@ Normal data points are surrounded by similar points and need many splits to isol
 
 2. **Measure path length:** For a new data point, feed it through all trees and record how deep it goes before being isolated. Short paths = easy to isolate = anomalous.
 
-3. **Normalize and calibrate:** We convert the raw "anomaly score" to a percentile using the training data's empirical CDF (Cumulative Distribution Function). A score of 0.95 means "more anomalous than 95% of training data."
+3. **Normalize and calibrate:** The raw anomaly score is a number whose scale depends on the training data — it's not directly interpretable. We convert it to a 0–1 percentile using the training data's **empirical CDF (Cumulative Distribution Function)**.
+
+   A CDF answers the question: "what fraction of values fall below X?" A *theoretical* CDF uses a mathematical formula (like the bell curve). An *empirical* CDF skips the formula and just uses the actual observed data — sort all training scores, and the percentile of a new score is its rank in that sorted list divided by the total count. No assumptions about what distribution the scores follow.
+
+   For example, if 950 out of 1000 training samples scored lower than the current observation, the empirical CDF gives percentile = 950/1000 = 0.95. We flip this to an anomaly score: `1.0 - 0.95 = 0.05` would mean "less anomalous than 95% of training" (normal), while `1.0 - 0.05 = 0.95` means "more anomalous than 95% of training" (suspicious).
 
 4. **Hard prediction via predict():** sklearn's `predict()` uses the contamination parameter (0.02 = we expect 2% of training data to be outliers) to set a decision threshold. Points more anomalous than this threshold return -1 (anomaly).
 
