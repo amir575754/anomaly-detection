@@ -320,7 +320,7 @@ Imagine a map of a city. Most people live in neighborhoods with many other nearb
 
 3. **Compare with neighbors' density:** The LOF score is the ratio of neighbors' average density to this point's density. If LOF > 1, the point is in a sparser region than its neighbors — it's an outlier.
 
-4. **Novelty mode:** We train LOF on clean data and score new data against the learned density structure. This is called `novelty=True` in sklearn.
+4. **Novelty mode (`novelty=True`):** By default, sklearn's LOF can only label the training data itself — it can't score new, unseen observations. Setting `novelty=True` switches it to novelty detection mode, where the model learns the density structure from clean training data and can then score incoming live telemetry against it. This is essential for our workflow: train once on baseline data, then score thousands of new events.
 
 ### Why LOF Complements Isolation Forest
 
