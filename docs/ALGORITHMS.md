@@ -145,19 +145,33 @@ Below is every feature the system extracts, grouped by configuration type. Each 
 
 #### Evasion Configuration (11 features)
 
+**Understanding the dependency chain:** The "dependencies" between evasion techniques are not hard technical requirements — AMSI bypass does not literally require string obfuscation to function. They are **behavioral correlations built into the synthetic data generator** that model how real operators tend to enable techniques in layers. An operator who enables the basics (string obfuscation) is much more likely to also enable the next tier (AMSI bypass: 65% chance) than an operator who skipped the basics (8% chance). This conditional-probability structure creates learnable correlations in the baseline data. The `dependency_coherence` feature measures whether a configuration follows these expected behavioral patterns — configurations that violate them (advanced techniques without foundations) are statistically unusual and worth flagging.
+
+```
+Layer 1 (basic):        obfuscate_strings (55% enabled)
+                              ↓ enables with 65% probability
+Layer 2 (intermediate): amsi_bypass_enabled    etw_patch_enabled (50%)    unhook_ntdll
+                              ↓                       ↓ enables with 65%        ↑
+                              ↓                       └──────────────────────────┘
+                              ↓ 2+ layer-2 techniques enable with 65%
+Layer 3 (advanced):     sleep_obfuscation
+                              ↓ enables with 55%
+                        stack_spoof (~15% enabled — rarest technique)
+```
+
 | Feature | Description | Typical Range |
 |---|---|---|
 | `evasion_enabled_count` | Number of evasion techniques currently enabled (out of 6). | 0 – 6 |
 | `evasion_enabled_ratio` | `evasion_enabled_count / 6`. Fraction of available techniques that are active. | 0.0 – 1.0 |
-| `evasion_layer_depth` | The highest dependency layer with any enabled technique (0–3). Layer 1 = basic (obfuscate_strings), Layer 2 = intermediate (AMSI bypass, ETW patch, unhook), Layer 3 = advanced (sleep obfuscation, stack spoofing). | 0 – 3 |
-| `dependency_coherence` | Fraction of enabled techniques whose prerequisites are also enabled. Returns 1.0 when all dependency chains are satisfied (normal). Lower values indicate broken chains — techniques enabled without their foundations. The `full_evasion` anomaly breaks all dependencies, producing coherence near 0. | 0.0 – 1.0 |
+| `evasion_layer_depth` | The highest dependency layer with any enabled technique (0–3). Layer 1 = basic, Layer 2 = intermediate, Layer 3 = advanced. | 0 – 3 |
+| `dependency_coherence` | Fraction of enabled techniques whose behavioral prerequisites are also enabled. Returns 1.0 when all expected chains are satisfied (normal operator behavior). Lower values mean an operator enabled advanced techniques while skipping the basics — a pattern that almost never occurs in the baseline data. | 0.0 – 1.0 |
 | `depth_per_enabled` | `evasion_layer_depth / evasion_enabled_count`. In baseline data, reaching layer 3 requires at least 3 enabled techniques (the prerequisites), so this ratio stays at or below 1.0. The `full_evasion` anomaly has depth=3 with count=1, producing a ratio of 3.0. | 0.0 – 3.0 |
-| `obfuscate_strings` | 1.0 if string obfuscation is enabled, 0.0 otherwise. Layer 1 — the foundation of the evasion chain. | 0 or 1 |
-| `amsi_bypass_enabled` | 1.0 if AMSI (Antimalware Scan Interface) bypass is enabled. Layer 2 — depends on obfuscate_strings. | 0 or 1 |
-| `etw_patch_enabled` | 1.0 if ETW (Event Tracing for Windows) patching is enabled. Layer 2 — independent of AMSI but same tier. | 0 or 1 |
-| `unhook_ntdll` | 1.0 if ntdll unhooking is enabled (removes security product hooks from system DLLs). Layer 2 — depends on etw_patch_enabled. | 0 or 1 |
-| `sleep_obfuscation` | 1.0 if sleep obfuscation is enabled (hides the implant during sleep periods). Layer 3 — depends on at least one layer-2 technique. | 0 or 1 |
-| `stack_spoof` | 1.0 if call stack spoofing is enabled (masks the implant's call stack). Layer 3 — depends on sleep_obfuscation. The rarest technique in baseline data (~15% enabled). | 0 or 1 |
+| `obfuscate_strings` | 1.0 if string obfuscation is enabled. Layer 1 — the most basic evasion technique; 55% of baseline configs enable it. | 0 or 1 |
+| `amsi_bypass_enabled` | 1.0 if AMSI (Antimalware Scan Interface) bypass is enabled. Layer 2 — operators who enable obfuscate_strings have a 65% chance of also enabling this; those who don't have only 8%. | 0 or 1 |
+| `etw_patch_enabled` | 1.0 if ETW (Event Tracing for Windows) patching is enabled. Layer 2 — 50% base rate, independent of AMSI. | 0 or 1 |
+| `unhook_ntdll` | 1.0 if ntdll unhooking is enabled (removes security product hooks from system DLLs). Layer 2 — follows the same conditional pattern as AMSI: 65% if etw is on, 12% if off. | 0 or 1 |
+| `sleep_obfuscation` | 1.0 if sleep obfuscation is enabled (hides the implant during sleep periods). Layer 3 — 65% if 2+ layer-2 techniques are on, 8% otherwise. | 0 or 1 |
+| `stack_spoof` | 1.0 if call stack spoofing is enabled (masks the implant's call stack). Layer 3 — 55% if sleep_obfuscation is on, 5% otherwise. The rarest technique in baseline data (~15% enabled overall). | 0 or 1 |
 
 ---
 

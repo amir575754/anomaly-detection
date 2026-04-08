@@ -367,17 +367,17 @@ Features capture **operational semantics** — the meaning of a configuration in
 |---|---|---|
 | `evasion_enabled_count` | Count | Number of evasion techniques enabled (out of 6) |
 | `evasion_enabled_ratio` | Ratio | `enabled_count / 6` — fraction of techniques active |
-| `evasion_layer_depth` | Derived | Highest active dependency layer (0–3); layer 3 = advanced techniques |
-| `dependency_coherence` | Derived | Fraction of enabled techniques whose prerequisites are also enabled (1.0 = normal) |
+| `evasion_layer_depth` | Derived | Highest active behavioral layer (0–3); layer 3 = advanced techniques |
+| `dependency_coherence` | Derived | Fraction of enabled techniques whose behavioral prerequisites are also enabled (1.0 = normal) |
 | `depth_per_enabled` | Ratio | `layer_depth / enabled_count` — exceeds 1.0 only when advanced techniques are on without foundations |
-| `obfuscate_strings` | Binary | Layer 1 — string obfuscation, foundation of the evasion chain |
-| `amsi_bypass_enabled` | Binary | Layer 2 — AMSI bypass, depends on obfuscate_strings |
-| `etw_patch_enabled` | Binary | Layer 2 — ETW patching, independent of AMSI |
-| `unhook_ntdll` | Binary | Layer 2 — ntdll unhooking, depends on etw_patch_enabled |
-| `sleep_obfuscation` | Binary | Layer 3 — hides implant during sleep, depends on layer-2 techniques |
-| `stack_spoof` | Binary | Layer 3 — call stack spoofing, depends on sleep_obfuscation; rarest technique (~15%) |
+| `obfuscate_strings` | Binary | Layer 1 — string obfuscation; 55% baseline rate |
+| `amsi_bypass_enabled` | Binary | Layer 2 — AMSI bypass; 65% if obfuscate is on, 8% if off |
+| `etw_patch_enabled` | Binary | Layer 2 — ETW patching; 50% independent rate |
+| `unhook_ntdll` | Binary | Layer 2 — ntdll unhooking; 65% if etw is on, 12% if off |
+| `sleep_obfuscation` | Binary | Layer 3 — sleep hiding; 65% if 2+ layer-2 on, 8% otherwise |
+| `stack_spoof` | Binary | Layer 3 — call stack spoofing; 55% if sleep_obfuscation on, 5% otherwise; rarest technique (~15%) |
 
-**Layered dependency chain:** The generator maintains a dependency structure (layer 1, 2, 3). Higher-layer techniques are rarely enabled without lower-layer prerequisites. `full_evasion` breaks this chain.
+**Behavioral dependency chain:** The "dependencies" are not hard technical requirements — they are conditional probabilities in the data generator that model how operators tend to enable techniques in layers (basics first, then advanced). The `dependency_coherence` feature measures whether a configuration follows these expected behavioral patterns. The `full_evasion` anomaly enables advanced techniques while skipping the basics, producing low coherence values that almost never occur in baseline data.
 
 ---
 
