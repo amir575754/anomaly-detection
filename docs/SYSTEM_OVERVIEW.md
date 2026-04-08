@@ -364,20 +364,20 @@ Features capture **operational semantics** — the meaning of a configuration in
 
 ## 8. Detection Engine — How Anomalies Are Found
 
-### Four-Detector Ensemble
+### Detection Ensemble
 
-Each telemetry event is scored by four independent algorithms:
+Each telemetry event is scored by three voting detectors plus one diagnostic measure:
 
 | Detector | Type | Catches | FP Characteristics |
 |---|---|---|---|
 | **IQR Fences** | Statistical, per-feature | Single-feature outliers, extreme deviations | Low FP (data-driven fences), interpretable |
 | **Isolation Forest** | Tree-based, multivariate | Complex multi-feature patterns, correlation violations | Moderate FP without corroboration, calibrated via contamination |
 | **Local Outlier Factor** | Density-based, multivariate | Local manifold deviations, cluster-edge anomalies | Moderate FP without corroboration |
-| **Mahalanobis Distance** | Parametric, covariance-aware | Deviations from multivariate normal center | Low FP (chi-squared p-values), but assumes normality |
+| **Mahalanobis Distance** | Parametric, covariance-aware (diagnostic only — does not vote on severity) | Displayed in alert panels for operator context | Principled p-values, but assumes normality; shown for diagnostics, not used in severity logic |
 
 ### The Corroboration Requirement
 
-**The single most important design decision for FP control.** We require at least two detector families to independently flag an event before issuing an alert. This exploits the fact that:
+**The single most important design decision for FP control.** For most alerts, we require at least two detector families to independently flag an event. The one exception: IQR "significant" (2+ deviating features or extreme single-feature deviation) can trigger MEDIUM alone because the evidence is already multi-dimensional and directly interpretable. This exploits the fact that:
 - True anomalies produce signals across multiple independent algorithms
 - False positives are typically noise from a single algorithm
 - Requiring agreement cuts the effective FP rate from ~5-10% (single detector) to <1% (joint agreement)
@@ -506,7 +506,7 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 | Injector | Config Type | Mechanism | Difficulty |
 |---|---|---|---|
-| `beacon_storm` | Communication | Beacon interval 30000 to 1200ms | Easy (extreme IQR) |
+| `beacon_storm` | Communication | Beacon interval reduced to 500-2000ms (from ~30,000ms baseline) | Easy (extreme IQR) |
 | `zero_jitter` | Communication | Jitter set to 0 | Easy (extreme IQR) |
 | `persistence_spike` | Persistence | Registry 50-200, tasks 20-50 | Easy (extreme IQR) |
 | `capability_explosion` | Capability | All caps enabled + high concurrency | Easy (multi-feature IQR) |
@@ -514,7 +514,7 @@ The PoC uses synthetic data with controlled anomaly injection:
 | `duplicated_persistence_setup` | Persistence | Depth-1 methods + depth-3 safety | Medium (correlation violation) |
 | `mismatched_escalation_policy` | Dangerous Program | Programs=audit, drivers=do_nothing + extra drivers | Medium (posture violation) |
 | `self_destruct_flood` | Dangerous Program | All actions to self_destruct + extra programs | Medium (ratio saturation) |
-| `forgotten_operation_teardown` | Capability | All caps enabled + concurrency=1, timeout=200s | Medium (extreme mismatch) |
+| `forgotten_operation_teardown` | Capability | All caps enabled + concurrency=1, timeout=150-200s | Medium (extreme mismatch) |
 | `full_evasion` | Evasion | Top-layer techniques without prerequisites | Hard (dependency chain violation) |
 
 ### Evaluation Metrics
@@ -643,6 +643,8 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 **Tradeoff:** For bounded features (ratios in [0,1]), P99 may equal 1.0, meaning the upper fence can't catch values at 1.0 even if they're rare. This is why we complement IQR with ML detectors.
 
+**Note on boolean/constant features:** When IQR is zero (common for boolean flags), P1/P99 clamping does not apply. Instead, the system falls back to MAD-based fences (if the data has some spread) or a tight epsilon band (if the feature is truly constant in training). This explains why `full_evasion` — which only flips boolean evasion flags — is difficult to detect: the fences for binary features cover the full 0-1 range observed in training.
+
 ---
 
 ## 14. What This PoC Proves
@@ -749,10 +751,17 @@ All tunable parameters are centralized in `config.py`:
 | `IQR_SIGNIFICANT_MULTIPLIER` | 3.0 | Deviation threshold for "significant" |
 | `IQR_SIGNIFICANT_FEATURE_COUNT` | 2 | Feature count threshold for "significant" |
 | `MINIMUM_IQR_DEVIATION` | 0.1 | Minimum deviation to count as "hard" |
+| `ZERO_IQR_EPSILON` | 0.01 | Epsilon band for truly constant features |
 | `ISOLATION_FOREST_ESTIMATORS` | 500 | Number of IF trees |
-| `ISOLATION_FOREST_CONTAMINATION` | 0.02 | Expected anomaly fraction in training |
+| `ISOLATION_FOREST_CONTAMINATION` | 0.02 | Expected anomaly fraction (IF training) |
 | `ISOLATION_FOREST_MAX_FEATURES` | 0.8 | Feature subsampling per tree |
+| `ISOLATION_FOREST_HIGH_THRESHOLD` | 0.95 | IF percentile score threshold (display) |
+| `ISOLATION_FOREST_MEDIUM_THRESHOLD` | 0.90 | IF percentile score threshold (display) |
 | `LOF_N_NEIGHBORS` | 20 | LOF density estimation neighbors |
+| `LOF_CONTAMINATION` | 0.02 | Expected anomaly fraction (LOF training) |
+| `LOF_HIGH_THRESHOLD` | 0.90 | LOF percentile score threshold (display) |
+| `MAHALANOBIS_P_VALUE_HIGH` | 0.001 | p-value for red color in panel (diagnostic) |
+| `MAHALANOBIS_P_VALUE_MEDIUM` | 0.01 | p-value for yellow color in panel (diagnostic) |
 | `SHAP_TOP_N_FEATURES` | 5 | Max SHAP features shown per alert |
 
 ### Baseline Management

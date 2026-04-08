@@ -58,7 +58,7 @@ Unsupervised detection is inherently harder than supervised. Without knowing wha
 - **Some normal data looks unusual** — a legitimate but rare configuration might trigger a false alarm.
 - **Precision matters** — if you alert on everything slightly unusual, operators will ignore the alerts (alert fatigue).
 
-This is why we use four different algorithms instead of one — they each see different types of "unusual."
+This is why we use multiple algorithms instead of one — they each see different types of "unusual." Three algorithms actively vote on severity (IQR, Isolation Forest, LOF), while a fourth (Mahalanobis distance) provides diagnostic context displayed in alert panels.
 
 ---
 
@@ -128,7 +128,7 @@ Observed value: 1200ms
 Some features are boolean (0 or 1) or near-constant. For these, IQR=0 and the standard formula breaks down. We use a cascade of fallbacks:
 
 1. **MAD (Median Absolute Deviation):** If the data has some spread but IQR is 0, use MAD × 1.4826 as a pseudo-IQR.
-2. **Training range:** If MAD is also 0 but values vary (e.g., 80% are 0, 20% are 1), use the min/max of training data as the fence boundaries.
+2. **Training range:** If MAD is also 0 but values vary (e.g., 80% are 0, 20% are 1), use the min/max of training data plus a tiny epsilon margin as the fence boundaries. Note: the IQR multiplier is NOT applied here — the fences are data-range-based, not spread-based.
 3. **Epsilon band:** If the feature is truly constant (all training values identical), use a tiny ±0.01 band — any different value is flagged.
 
 ### Strengths
@@ -257,33 +257,34 @@ Standard Euclidean distance treats all directions equally. But in real data, fea
 
 - **Assumes multivariate normality:** Real data (especially boolean features) isn't normally distributed. This weakens the p-value interpretation.
 - **Sensitive to covariance estimation:** With more features than samples, the covariance matrix becomes ill-conditioned. We add regularization (small diagonal term) to prevent this.
-- **Supplementary role in our system:** Due to the normality limitation, Mahalanobis serves as supporting evidence rather than a primary detector.
+- **Diagnostic-only in our system:** Due to the normality limitation, Mahalanobis does **not** participate in severity voting. It is computed and displayed in alert panels as supplementary context for the operator (the p-value helps assess how statistically unusual the configuration is), but it does not trigger or suppress alerts. The three voting detectors are IQR, IF, and LOF.
 
 ---
 
 ## 8. How We Combine Them — Ensemble Voting
 
-No single algorithm is perfect. IQR catches single-feature outliers but misses correlations. IF catches complex patterns but can produce noisy scores. LOF captures local structure. Mahalanobis provides principled statistics. By combining them, we get the strengths of all four while mitigating individual weaknesses.
+No single algorithm is perfect. IQR catches single-feature outliers but misses correlations. IF catches complex patterns but can produce noisy scores. LOF captures local structure. By combining their **severity votes**, we get the strengths of all three while mitigating individual weaknesses. (Mahalanobis distance is computed and displayed for diagnostic context but does not participate in severity voting — see Section 7.)
 
 ### The Corroboration Principle
 
 The key insight behind our ensemble: **real anomalies trigger multiple detectors independently; random noise triggers only one.**
 
-A beacon_storm anomaly (beacon_interval dropped from 30000 to 1200) will:
+A beacon_storm anomaly (beacon_interval dropped from ~30,000 to ~1,200) will:
 - Trigger IQR (massive deviation on beacon_interval)
-- Trigger IF (unusual point in the feature space)
-- Trigger LOF (sparse neighborhood)
-- Maybe trigger Mahalanobis (far from centroid)
+- Trigger IF predict() (unusual point in the feature space)
+- Trigger LOF predict() (sparse neighborhood)
 
 But a normal event that happens to have a slightly unusual jitter_percentage might:
-- Trigger IF (borderline score due to noise)
-- Not trigger IQR, LOF, or Mahalanobis
+- Trigger IF predict() (borderline score due to noise)
+- Not trigger IQR or LOF
 
-By **requiring at least two detectors to agree**, we dramatically reduce false positives while preserving true positive detection.
+For most severity levels, we require at least two detector families to agree. The one exception: **IQR significant** (2+ deviating features or an extreme single-feature deviation) is strong enough to fire MEDIUM on its own, because the evidence is already multi-dimensional and directly interpretable.
 
 ### How predict() Reduces False Positives
 
-A critical innovation: instead of using continuous anomaly scores with thresholds (where 10% of clean data scores above the 90th percentile by definition), we use sklearn's `predict()` method which produces a binary yes/no decision calibrated to the contamination rate.
+Instead of using continuous anomaly scores with thresholds (where 10% of clean data scores above the 90th percentile by definition), we use sklearn's `predict()` method for the IF and LOF severity votes. `predict()` produces a binary yes/no decision calibrated to the contamination rate.
+
+Note: the system also computes continuous percentile scores for both IF and LOF (via the empirical CDF of training scores). These are displayed in alert panels for operator context. But the **severity voting** uses only the binary `predict()` output, not the continuous scores.
 
 With `contamination=0.02`:
 - IF's `predict()` flags ~2% of training data as anomalous
@@ -298,8 +299,8 @@ This gives us a structural FP guarantee: **requiring both ML models to agree lim
 HIGH:   IQR significant + any ML predict
         OR both IF and LOF predict anomaly
 
-MEDIUM: IQR significant alone
-        OR IQR any + one ML predict
+MEDIUM: IQR significant alone (strong per-feature evidence)
+        OR IQR any + one ML predict (corroboration)
 
 (none): Everything else — not reported
 ```
@@ -336,7 +337,7 @@ SHAP is based on Shapley values from cooperative game theory. The idea: try ever
 
 ## 10. Severity Classification
 
-Every detected anomaly is assigned one of three severity levels:
+Every detected anomaly is assigned one of two severity levels. Events that don't meet the evidence threshold are suppressed entirely:
 
 ### HIGH
 
@@ -372,7 +373,7 @@ During the cold-start period, the group baseline handles detection. Once enough 
 ### Retraining
 
 Baselines are not static. As new telemetry arrives:
-- Feature vectors are appended to a sliding window in Redis (max 1000 entries per scope).
+- Feature vectors are appended to a sliding window in Redis (max 1000 entries for group windows, 300 for per-implant windows).
 - When 100+ new entries arrive since the last training, the detector retrains the models automatically.
 - Old entries are trimmed from the window, so the baseline tracks the recent distribution.
 
@@ -390,7 +391,7 @@ Baselines are not static. As new telemetry arrives:
 | **SHAP** | SHapley Additive exPlanations — a method to explain which features contributed to a model's prediction. |
 | **Contamination** | The expected fraction of anomalies in training data. Controls how aggressively models flag outliers. |
 | **Feature vector** | A flat list of numbers extracted from a raw configuration snapshot, suitable for mathematical algorithms. |
-| **Baseline** | A statistical model of "normal" behavior, learned from historical data. Includes IQR fences, IF model, LOF model, and Mahalanobis parameters. |
+| **Baseline** | A statistical model of "normal" behavior, learned from historical data. Includes IQR fences, IF model, LOF model, and Mahalanobis parameters (diagnostic only). |
 | **Percentile scoring** | Converting a raw algorithm score to a 0–1 scale based on how it ranks against training data scores. |
 | **Corroboration** | The requirement that multiple independent detectors agree before issuing an alert. Reduces false positives. |
 | **Cold start** | The period when a new implant has insufficient history for a per-implant baseline. |
