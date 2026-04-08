@@ -18,7 +18,7 @@ class Severity(enum.Enum):
 class TelemetryRow(TypedDict):
     id: int
     implant_id: str
-    group_id: str
+    group_id: str       # joined from implants table at query time
     config_type: str
     received_at: datetime
     features: dict[str, float] | str
@@ -48,5 +48,9 @@ class ScoredEvent:
     telemetry_row: TelemetryRow
     deviating_features: list[FeatureDeviation]
     isolation_forest_score: float
+    lof_score: float
+    mahalanobis_p_value: float
+    if_predicts_anomaly: bool
+    lof_predicts_anomaly: bool
     baseline_used: str     # "implant" or "group"
     shap_contributions: list[ShapContribution] = field(default_factory=list)

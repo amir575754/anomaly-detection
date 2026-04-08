@@ -10,7 +10,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import config  # noqa: E402 — path setup required before import
-from rich.console import Console
+from rich.console import Console, Group
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -25,7 +25,6 @@ console = Console()
 SEVERITY_BORDER = {
     Severity.HIGH: "red",
     Severity.MEDIUM: "yellow",
-    Severity.LOW: "cyan",
 }
 
 
@@ -48,16 +47,17 @@ def _build_iqr_table(event: ScoredEvent) -> Table | None:
 
 
 def _build_shap_table(event: ScoredEvent) -> Table | None:
-    """Build a mini table of SHAP contributions (IF-only detections)."""
-    if not event.shap_contributions or event.deviating_features:
+    """Build a mini table of SHAP contributions."""
+    if not event.shap_contributions:
         return None
     table = Table(show_header=False, show_edge=False, box=None, padding=(0, 1))
     table.add_column("feature", style="bold")
     table.add_column("contribution", justify="right")
     for contribution in event.shap_contributions:
+        color = "red" if contribution.contribution > 0 else "green"
         table.add_row(
             contribution.feature_name,
-            f"{contribution.contribution:+.3f}",
+            f"[{color}]{contribution.contribution:+.3f}[/{color}]",
         )
     return table
 
@@ -77,7 +77,7 @@ def _build_panel(event: ScoredEvent, severity: Severity) -> Panel:
     iqr_table = _build_iqr_table(event)
     shap_table = _build_shap_table(event)
 
-    parts: list = []
+    parts: list[Text | Table] = []
     if iqr_table is not None:
         parts.append(Text("IQR Deviations:", style="bold underline"))
         parts.append(iqr_table)
@@ -85,33 +85,42 @@ def _build_panel(event: ScoredEvent, severity: Severity) -> Panel:
         parts.append(Text("SHAP Contributions:", style="bold underline"))
         parts.append(shap_table)
 
-    from rich.console import Group
-    parts.append(Text(f"IF Score: {event.isolation_forest_score:.3f}", style="bold"))
+    scores_text = Text()
+    scores_text.append("IF: ", style="bold")
+    scores_text.append(f"{event.isolation_forest_score:.3f}", style="bold magenta")
+    scores_text.append("  LOF: ", style="bold")
+    scores_text.append(f"{event.lof_score:.3f}", style="bold magenta")
+    scores_text.append("  Mahal p: ", style="bold")
+    p_color = (
+        "red" if event.mahalanobis_p_value < config.MAHALANOBIS_P_VALUE_HIGH
+        else "yellow" if event.mahalanobis_p_value < config.MAHALANOBIS_P_VALUE_MEDIUM
+        else "green"
+    )
+    scores_text.append(f"{event.mahalanobis_p_value:.1e}", style=f"bold {p_color}")
+    parts.append(scores_text)
     panel_body = Group(*parts)
 
     return Panel(panel_body, title=title, subtitle=subtitle, border_style=color, expand=False)
 
 
 def print_detections(scored_events: list[ScoredEvent]) -> int:
-    """Determine severity and print detected anomalies. Returns count printed.
-
-    Prints HIGH (IQR + IF agree), MEDIUM only when IQR flagged something,
-    and LOW (IF-only with high score). Skips MEDIUM events with no IQR
-    evidence to keep the CLI readable without deduplication.
-    """
+    """Determine severity and print detected anomalies. Returns count printed."""
     summary = DetectionSummary()
     summary.total_scored = len(scored_events)
     for event in scored_events:
-        severity = determine_severity(event.deviating_features, event.isolation_forest_score)
+        summary.record_scored(event)
+        severity = determine_severity(
+            event.deviating_features,
+            event.if_predicts_anomaly,
+            event.lof_predicts_anomaly,
+        )
         if severity is None:
-            continue
-        if severity == Severity.MEDIUM and not event.deviating_features:
-            summary.record_suppressed()
+            row = event.telemetry_row
+            if row.get("is_anomaly") and row.get("injector_tag"):
+                summary.record_miss(event)
             continue
         console.print(_build_panel(event, severity))
         summary.record(event, severity)
-    if summary.total_suppressed:
-        logger.debug("Suppressed %d IF-only MEDIUM events (no IQR evidence)", summary.total_suppressed)
-    if summary.total_printed > 0:
+    if summary.total_scored > 0:
         summary.print_summary()
     return summary.total_printed

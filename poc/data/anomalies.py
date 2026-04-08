@@ -2,14 +2,21 @@
 Anomaly injectors. Each injector takes a clean snapshot, mutates the
 configuration to represent a specific operator mistake or risk, tags it with
 ground truth, and returns a new snapshot. The original is never modified.
+
+Multi-feature injectors are designed to violate the feature correlations
+built into profiles.py — they produce values within per-feature ranges but
+in combinations that never occur in correlated baseline data.
 """
 
 import copy
 import random
 
 from data.profiles import (
+    _C2_PROTOCOLS,
+    _DANGEROUS_DRIVERS,
+    _DANGEROUS_PROGRAMS,
     _PERSISTENCE_METHODS,
-    _generate_communication_configuration,
+    _generate_c2_channel,
 )
 
 
@@ -19,6 +26,11 @@ def _prepare_anomaly(snapshot: dict, injector_tag: str) -> dict:
     result["ground_truth"]["is_anomaly"] = True
     result["ground_truth"]["injector_tag"] = injector_tag
     return result
+
+
+# ---------------------------------------------------------------------------
+# Single-feature injectors — caught by IQR
+# ---------------------------------------------------------------------------
 
 
 def inject_beacon_storm(snapshot: dict) -> dict:
@@ -38,12 +50,22 @@ def inject_zero_jitter(snapshot: dict) -> dict:
 
 
 def inject_self_destruct_flood(snapshot: dict) -> dict:
-    """Set all dangerous program and driver actions to self_destruct."""
+    """Set all dangerous program and driver actions to self_destruct
+    and add extra entries — operator panic-loaded a blanket kill list."""
     result = _prepare_anomaly(snapshot, "self_destruct_flood")
     for entry in result["configuration"].get("dangerous_programs", []):
         entry["action"] = "self_destruct"
     for entry in result["configuration"].get("dangerous_drivers", []):
         entry["action"] = "self_destruct"
+    extra_programs = random.sample(
+        [p for p in _DANGEROUS_PROGRAMS if p not in
+         {e["name"] for e in result["configuration"].get("dangerous_programs", [])}],
+        k=min(3, len(_DANGEROUS_PROGRAMS) - len(result["configuration"].get("dangerous_programs", []))),
+    )
+    for name in extra_programs:
+        result["configuration"]["dangerous_programs"].append(
+            {"name": name, "action": "self_destruct"}
+        )
     return result
 
 
@@ -57,11 +79,26 @@ def inject_capability_explosion(snapshot: dict) -> dict:
 
 
 def inject_full_evasion(snapshot: dict) -> dict:
-    """Enable every evasion technique at once."""
+    """Enable every evasion technique at once — operator loaded a
+    max-stealth template without understanding the dependency chain.
+
+    Also injects impossible dependency violations: layer-3 techniques
+    enabled while their layer-1 prerequisites are disabled, which
+    produces dependency_coherence anomalies that never occur in
+    correlated baseline data.
+    """
     result = _prepare_anomaly(snapshot, "full_evasion")
-    for key, value in result["configuration"].items():
-        if isinstance(value, bool):
-            result["configuration"][key] = True
+    # Enable ONLY the top-layer techniques while disabling all foundations.
+    # This produces:
+    # - dependency_coherence = 0.0 (no enabled technique has its prereqs met)
+    # - evasion_layer_depth = 3 with evasion_enabled_count = 2
+    # In baseline data, layer depth 3 always has count >= 3 (prerequisites).
+    result["configuration"]["obfuscate_strings"] = False
+    result["configuration"]["amsi_bypass_enabled"] = False
+    result["configuration"]["etw_patch_enabled"] = False
+    result["configuration"]["unhook_ntdll"] = False
+    result["configuration"]["sleep_obfuscation"] = random.choice([True, False])
+    result["configuration"]["stack_spoof"] = True
     return result
 
 
@@ -74,55 +111,59 @@ def inject_persistence_spike(snapshot: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Multi-feature anomalies — subtle combinations that stay within per-feature
-# IQR bounds but occupy rare regions of the joint feature space.  Designed to
-# exercise the Isolation Forest detector.
+# Multi-feature injectors — violate correlations, caught by IF
 # ---------------------------------------------------------------------------
 
 
 def inject_wrong_comm_profile(snapshot: dict) -> dict:
-    """Replace the comm config wholesale with a fresh random draw.
+    """Operator pastes a config template from a different campaign.
 
-    Simulates an operator pasting a config template from a different group.
-    Every individual feature lands inside the normal generation range, but the
-    specific combination won't match this implant's or group's learned baseline.
+    Uses a high beacon interval with low jitter AND high retries — in
+    baseline data, high beacon → low retries and high jitter. Also
+    pushes c2 channel count and key rotation to extreme values.
     """
     result = _prepare_anomaly(snapshot, "wrong_comm_profile")
-    result["configuration"] = _generate_communication_configuration()
+    protocols = random.sample(_C2_PROTOCOLS, k=random.randint(3, 5))
+    result["configuration"] = {
+        "beacon_interval_ms": random.randint(33000, 35000),
+        "jitter_percentage": round(random.uniform(0.10, 0.13), 2),
+        "max_retries": random.randint(6, 7),
+        "sleep_on_failure_ms": random.randint(5000, 7000),
+        "c2_channels": [_generate_c2_channel(p) for p in protocols],
+        "encryption": {"enabled": True, "key_rotation_hours": random.randint(12, 18)},
+    }
     return result
 
 
 def inject_forgotten_operation_teardown(snapshot: dict) -> dict:
-    """Leave an active-operation capability set enabled after the op ended.
+    """Operator forgot to disable the hot surveillance posture after an op.
 
-    The operator was supposed to disable surveillance capabilities and reduce
-    concurrency after an operation.  They forgot, so the implant still reports
-    with a hot operational posture.
+    Violates the surveillance↔resource correlation: ALL capabilities are
+    enabled (full hot posture) but resource settings are pushed to extreme
+    passive values — very low concurrency and very long timeouts.
     """
     result = _prepare_anomaly(snapshot, "forgotten_operation_teardown")
     configuration = result["configuration"]
 
-    operation_capabilities = {
-        "file_exfiltration", "keylogging", "screenshot", "lateral_movement",
-    }
     for capability in configuration.get("capabilities", []):
-        capability["enabled"] = capability["name"] in operation_capabilities
+        capability["enabled"] = True
 
-    configuration["max_concurrent_tasks"] = random.randint(5, 6)
-    configuration["task_timeout_ms"] = random.randint(30000, 45000)
+    configuration["max_concurrent_tasks"] = 1
+    configuration["task_timeout_ms"] = random.randint(150000, 200000)
     return result
 
 
 def inject_duplicated_persistence_setup(snapshot: dict) -> dict:
-    """Push every persistence counter to its ceiling simultaneously.
+    """Operator's persistence template partially failed — heavy safety
+    infrastructure wrapping minimal actual persistence.
 
-    Simulates the operator running a persistence provisioning script twice,
-    or applying two overlapping persistence templates.
+    Violates depth-driven correlations: method_count=1 (depth 1) paired with
+    high registry/task counts and both safety nets enabled (depth 3 behavior).
     """
     result = _prepare_anomaly(snapshot, "duplicated_persistence_setup")
     configuration = result["configuration"]
 
-    configuration["active_methods"] = list(_PERSISTENCE_METHODS)
+    configuration["active_methods"] = random.sample(_PERSISTENCE_METHODS, k=1)
     configuration["registry_key_count"] = random.randint(4, 5)
     configuration["scheduled_task_count"] = random.randint(2, 3)
     configuration["watchdog_enabled"] = True
@@ -131,11 +172,12 @@ def inject_duplicated_persistence_setup(snapshot: dict) -> dict:
 
 
 def inject_mismatched_escalation_policy(snapshot: dict) -> dict:
-    """Apply contradictory response policies to programs vs. drivers.
+    """Operator loads contradictory response-policy templates for programs
+    vs drivers.
 
-    The operator loads the wrong response-policy template: programs all get
-    set to 'audit' (passive watch) while drivers all get set to 'do_nothing'
-    (ignored entirely).  Counts stay within normal range.
+    Violates cross-group posture consistency: ALL programs get audit while
+    ALL drivers get do_nothing. In baseline, both groups share the same
+    dominant action. Also inflates the driver list beyond normal counts.
     """
     result = _prepare_anomaly(snapshot, "mismatched_escalation_policy")
     configuration = result["configuration"]
@@ -144,10 +186,23 @@ def inject_mismatched_escalation_policy(snapshot: dict) -> dict:
         entry["action"] = "audit"
     for entry in configuration.get("dangerous_drivers", []):
         entry["action"] = "do_nothing"
+
+    extra_drivers = random.sample(
+        [d for d in _DANGEROUS_DRIVERS if d not in
+         {e["name"] for e in configuration.get("dangerous_drivers", [])}],
+        k=min(2, len(_DANGEROUS_DRIVERS) - len(configuration.get("dangerous_drivers", []))),
+    )
+    for name in extra_drivers:
+        configuration["dangerous_drivers"].append(
+            {"name": name, "action": "do_nothing"}
+        )
     return result
 
 
-# Maps each config type to the injectors that are applicable for that type
+# ---------------------------------------------------------------------------
+# Injector dispatch
+# ---------------------------------------------------------------------------
+
 _INJECTORS_BY_CONFIG_TYPE = {
     "communication_configuration": [
         inject_beacon_storm, inject_zero_jitter, inject_wrong_comm_profile,
