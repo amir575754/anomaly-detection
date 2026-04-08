@@ -133,26 +133,38 @@ def _extract_communication(configuration: dict) -> dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# Persistence configuration — safety-to-depth ratio
+# Persistence configuration — method-type-driven features
 # ---------------------------------------------------------------------------
+
+_PERSISTENCE_METHOD_SET = [
+    "registry_run", "scheduled_task", "service_install",
+    "startup_folder", "wmi_subscription",
+]
+
 
 def _extract_persistence(configuration: dict) -> dict[str, float]:
     methods = configuration.get("active_methods", [])
-    method_count = len(methods)
+    method_name = methods[0] if methods else "unknown"
     registry_key_count = configuration.get("registry_key_count", 0)
     scheduled_task_count = configuration.get("scheduled_task_count", 0)
     watchdog = 1.0 if configuration.get("watchdog_enabled") else 0.0
     reinstall = 1.0 if configuration.get("reinstall_on_removal") else 0.0
 
-    return {
-        "active_method_count": float(method_count),
+    features: dict[str, float] = {
         "registry_key_count": float(registry_key_count),
         "scheduled_task_count": float(scheduled_task_count),
         "watchdog_enabled": watchdog,
         "reinstall_on_removal": reinstall,
-        "total_persistence_footprint": float(method_count + registry_key_count + scheduled_task_count),
-        "safety_to_depth_ratio": (watchdog + reinstall) / max(1, method_count),
+        "total_persistence_footprint": float(registry_key_count + scheduled_task_count),
+        "safety_net_count": watchdog + reinstall,
     }
+
+    # One-hot encode the method type so the ML models can learn
+    # per-method infrastructure expectations.
+    for candidate in _PERSISTENCE_METHOD_SET:
+        features[f"method_{candidate}"] = 1.0 if candidate == method_name else 0.0
+
+    return features
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,6 @@ from data.profiles import (
     _C2_PROTOCOLS,
     _DANGEROUS_DRIVERS,
     _DANGEROUS_PROGRAMS,
-    _PERSISTENCE_METHODS,
     _generate_c2_channel,
 )
 
@@ -103,10 +102,11 @@ def inject_full_evasion(snapshot: dict) -> dict:
 
 
 def inject_persistence_spike(snapshot: dict) -> dict:
-    """Inflate registry key count and scheduled task count to unusual levels."""
+    """Inflate registry key count and scheduled task count far beyond
+    what any single method would normally produce."""
     result = _prepare_anomaly(snapshot, "persistence_spike")
-    result["configuration"]["registry_key_count"] = random.randint(50, 200)
-    result["configuration"]["scheduled_task_count"] = random.randint(20, 50)
+    result["configuration"]["registry_key_count"] = random.randint(15, 40)
+    result["configuration"]["scheduled_task_count"] = random.randint(8, 20)
     return result
 
 
@@ -154,18 +154,20 @@ def inject_forgotten_operation_teardown(snapshot: dict) -> dict:
 
 
 def inject_duplicated_persistence_setup(snapshot: dict) -> dict:
-    """Operator's persistence template partially failed — heavy safety
-    infrastructure wrapping minimal actual persistence.
+    """Operator applied a registry_run template but the infrastructure
+    matches a scheduled_task setup — wrong template for the method.
 
-    Violates depth-driven correlations: method_count=1 (depth 1) paired with
-    high registry/task counts and both safety nets enabled (depth 3 behavior).
+    Violates method-type correlations: registry_run normally has 2-4
+    registry keys and 0 scheduled tasks, but this config has 0 registry
+    keys and 3-5 scheduled tasks. Both safety nets are also enabled,
+    which is unusual for registry_run (normally ~20-30% each).
     """
     result = _prepare_anomaly(snapshot, "duplicated_persistence_setup")
     configuration = result["configuration"]
 
-    configuration["active_methods"] = random.sample(_PERSISTENCE_METHODS, k=1)
-    configuration["registry_key_count"] = random.randint(4, 5)
-    configuration["scheduled_task_count"] = random.randint(2, 3)
+    configuration["active_methods"] = ["registry_run"]
+    configuration["registry_key_count"] = 0
+    configuration["scheduled_task_count"] = random.randint(3, 5)
     configuration["watchdog_enabled"] = True
     configuration["reinstall_on_removal"] = True
     return result

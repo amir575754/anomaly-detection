@@ -148,28 +148,53 @@ def _generate_communication_configuration() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Persistence configuration — depth-driven correlations
+# Persistence configuration — method-type-driven correlations
 # ---------------------------------------------------------------------------
 
-_DEPTH_REGISTRY_RANGE = {1: (1, 2), 2: (2, 3), 3: (3, 5)}
-_DEPTH_TASK_RANGE = {1: (0, 0), 2: (0, 1), 3: (1, 3)}
-_DEPTH_WATCHDOG_PROB = {1: 0.10, 2: 0.30, 3: 0.80}
-_DEPTH_REINSTALL_PROB = {1: 0.05, 2: 0.20, 3: 0.70}
+# Each method type has characteristic infrastructure: registry-heavy methods
+# use more registry keys, task-based methods use more scheduled tasks.
+_METHOD_REGISTRY_RANGE = {
+    "registry_run": (2, 4),
+    "scheduled_task": (0, 1),
+    "service_install": (1, 2),
+    "startup_folder": (0, 1),
+    "wmi_subscription": (0, 1),
+}
+_METHOD_TASK_RANGE = {
+    "registry_run": (0, 0),
+    "scheduled_task": (1, 3),
+    "service_install": (0, 1),
+    "startup_folder": (0, 0),
+    "wmi_subscription": (1, 2),
+}
+_METHOD_WATCHDOG_PROB = {
+    "registry_run": 0.30,
+    "scheduled_task": 0.25,
+    "service_install": 0.60,
+    "startup_folder": 0.10,
+    "wmi_subscription": 0.40,
+}
+_METHOD_REINSTALL_PROB = {
+    "registry_run": 0.20,
+    "scheduled_task": 0.15,
+    "service_install": 0.50,
+    "startup_folder": 0.05,
+    "wmi_subscription": 0.30,
+}
 
 
 def _generate_persistence_configuration() -> dict:
-    method_count = random.randint(1, 3)
-    methods = random.sample(_PERSISTENCE_METHODS, k=method_count)
+    method = random.choice(_PERSISTENCE_METHODS)
 
-    reg_low, reg_high = _DEPTH_REGISTRY_RANGE[method_count]
-    task_low, task_high = _DEPTH_TASK_RANGE[method_count]
+    reg_low, reg_high = _METHOD_REGISTRY_RANGE[method]
+    task_low, task_high = _METHOD_TASK_RANGE[method]
 
     return {
-        "active_methods": methods,
+        "active_methods": [method],
         "registry_key_count": random.randint(reg_low, reg_high),
         "scheduled_task_count": random.randint(task_low, task_high),
-        "watchdog_enabled": random.random() < _DEPTH_WATCHDOG_PROB[method_count],
-        "reinstall_on_removal": random.random() < _DEPTH_REINSTALL_PROB[method_count],
+        "watchdog_enabled": random.random() < _METHOD_WATCHDOG_PROB[method],
+        "reinstall_on_removal": random.random() < _METHOD_REINSTALL_PROB[method],
     }
 
 

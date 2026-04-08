@@ -35,10 +35,10 @@ This proof-of-concept demonstrates an **autonomous anomaly detection platform** 
 
 | Metric | Achieved | Target |
 |---|---|---|
-| Detection rate (true anomalies caught) | **82.1%** | >70% |
-| False positive rate (false alerts / total alerts) | **28.9%** | <40% |
-| Precision (true alerts / total alerts) | **71.1%** | — |
-| Per-injector detection (9 of 10 types) | **80–100%** | — |
+| Detection rate (true anomalies caught) | **88.0%** | >70% |
+| False positive rate (false alerts / total alerts) | **22.7%** | <40% |
+| Precision (true alerts / total alerts) | **77.3%** | — |
+| Per-injector detection (10 of 10 types) | **60–100%** | — |
 
 ### What the Demo Shows
 
@@ -331,19 +331,25 @@ Features capture **operational semantics** — the meaning of a configuration in
 | `action_diversity` | Count | Distinct actions present (1 = all same action, 3 = all three used) |
 | `dominant_action_ratio` | Ratio | Fraction of entries assigned to the most common action |
 
-#### Persistence Configuration (7 features)
+#### Persistence Configuration (11 features)
+
+Operational implants use a single persistence method. Features capture the method type (one-hot) and its supporting infrastructure.
 
 | Feature | Type | Description |
 |---|---|---|
-| `active_method_count` | Count | Active persistence methods (registry_run, scheduled_task, etc.) — drives "depth" |
-| `registry_key_count` | Count | Registry keys used; correlates with method count in baseline |
-| `scheduled_task_count` | Count | Scheduled tasks created; correlates with method count in baseline |
-| `watchdog_enabled` | Binary | 1.0 if a watchdog monitors persistence health — normally only at high depth |
-| `reinstall_on_removal` | Binary | 1.0 if auto-reinstall on removal — normally only at high depth |
-| `total_persistence_footprint` | Sum | `method_count + registry_keys + scheduled_tasks` — overall persistence weight |
-| `safety_to_depth_ratio` | Ratio | `(watchdog + reinstall) / method_count` — safety infrastructure per method; anomalous when high safety wraps low depth |
+| `registry_key_count` | Count | Registry keys used; method-type dependent in baseline |
+| `scheduled_task_count` | Count | Scheduled tasks created; method-type dependent in baseline |
+| `watchdog_enabled` | Binary | 1.0 if a watchdog monitors persistence health |
+| `reinstall_on_removal` | Binary | 1.0 if auto-reinstall on removal |
+| `total_persistence_footprint` | Sum | `registry_keys + scheduled_tasks` — overall infrastructure weight |
+| `safety_net_count` | Sum | `watchdog + reinstall` — count of active safety mechanisms (0–2) |
+| `method_registry_run` | Binary | 1.0 if using registry_run persistence |
+| `method_scheduled_task` | Binary | 1.0 if using scheduled_task persistence |
+| `method_service_install` | Binary | 1.0 if using service_install persistence |
+| `method_startup_folder` | Binary | 1.0 if using startup_folder persistence |
+| `method_wmi_subscription` | Binary | 1.0 if using wmi_subscription persistence |
 
-**Correlated generation (synthetic):** Method count drives registry/task counts and safety net probabilities via hand-picked depth-dependent lookup tables (e.g., depth 1: registry 1–2, watchdog 10%; depth 3: registry 3–5, watchdog 80%). `duplicated_persistence_setup` violates this by pairing depth-1 methods with depth-3 safety infrastructure. These depth-to-resource mappings are authorial assumptions.
+**Correlated generation (synthetic):** Each method type has hand-picked per-method infrastructure ranges (e.g., `registry_run`: 2–4 keys, 0 tasks, 30% watchdog; `scheduled_task`: 0–1 keys, 1–3 tasks, 25% watchdog). `duplicated_persistence_setup` violates this by using a `registry_run` method with scheduled_task infrastructure. These per-method mappings are authorial assumptions.
 
 #### Capability Configuration (9 features)
 
@@ -562,34 +568,34 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 | Metric | Value |
 |---|---|
-| **Detection rate** | 82.1% |
-| **False positive rate** | 28.9% |
-| **Precision** | 71.1% |
+| **Detection rate** | 88.0% |
+| **False positive rate** | 22.7% |
+| **Precision** | 77.3% |
 | Events scored | 5,000 |
-| Anomalies injected | ~201 |
-| True positives | 165 |
-| False positives | 67 |
+| Anomalies injected | ~209 |
+| True positives | 184 |
+| False positives | 54 |
 
 ### Per-Injector Breakdown
 
 | Injector | Injected | Detected | Rate |
 |---|---|---|---|
-| beacon_storm | 24 | 24 | **100%** |
-| zero_jitter | 15 | 15 | **100%** |
-| capability_explosion | 22 | 22 | **100%** |
-| persistence_spike | 21 | 21 | **100%** |
-| duplicated_persistence_setup | 14 | 14 | **100%** |
-| forgotten_operation_teardown | 16 | 16 | **100%** |
-| wrong_comm_profile | 13 | 13 | **100%** |
-| mismatched_escalation_policy | 22 | 19 | **86%** |
-| self_destruct_flood | 26 | 21 | **81%** |
-| full_evasion | 28 | 0 | **0%** |
+| beacon_storm | 16 | 16 | **100%** |
+| zero_jitter | 16 | 16 | **100%** |
+| capability_explosion | 18 | 18 | **100%** |
+| persistence_spike | 25 | 25 | **100%** |
+| forgotten_operation_teardown | 15 | 15 | **100%** |
+| wrong_comm_profile | 22 | 22 | **100%** |
+| duplicated_persistence_setup | 23 | 20 | **87%** |
+| mismatched_escalation_policy | 21 | 18 | **86%** |
+| full_evasion | 33 | 22 | **67%** |
+| self_destruct_flood | 20 | 12 | **60%** |
 
 ### Interpretation
 
-- **9 of 10 anomaly types** are detected at 81-100%
-- **`full_evasion` (0%)** represents a fundamental limitation of unsupervised detection on binary features — see Section 15
-- Excluding `full_evasion`, detection rate is **95.4%** (165/173)
+- **All 10 anomaly types** are now detected at 60-100%
+- **`full_evasion` improved from 0% to 67%** after redesigning persistence features with one-hot method encoding, which gave the ML models richer signal across all config types
+- The two weakest injectors (`self_destruct_flood` at 60%, `full_evasion` at 67%) represent correlation-only anomalies where individual features stay within normal ranges
 
 ---
 
@@ -684,11 +690,11 @@ The PoC uses synthetic data with controlled anomaly injection:
 
 ### 1. Autonomous Detection Is Viable
 
-The system detects 9 out of 10 anomaly types at 81-100% without any hand-written rules. It learned what "normal" looks like from 10 days of synthetic history and immediately began flagging deviations.
+The system detects all 10 anomaly types at 60-100% without any hand-written rules. It learned what "normal" looks like from 10 days of synthetic history and immediately began flagging deviations.
 
 ### 2. False Positive Rate Is Controllable
 
-At 28.9% FP rate (71.1% precision), the alert stream is readable. The corroboration requirement between detector families is the key mechanism — it provides structural FP control independent of threshold tuning.
+At 22.7% FP rate (77.3% precision), the alert stream is readable. The corroboration requirement between detector families is the key mechanism — it provides structural FP control independent of threshold tuning.
 
 ### 3. Multi-Algorithm Ensemble Provides Robustness
 

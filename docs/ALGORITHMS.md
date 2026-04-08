@@ -129,17 +129,25 @@ Below is every feature the system extracts, grouped by configuration type. Each 
 | `action_diversity` | Number of distinct actions present across all entries. Normal configs have 2–3 distinct actions; a value of 1 means every entry has the same action. | 1 – 3 |
 | `dominant_action_ratio` | Fraction of all entries assigned to the most common action. Higher values mean a more uniform (less diverse) policy. | 0.33 – 1.0 |
 
-#### Persistence Configuration (7 features)
+#### Persistence Configuration (11 features)
+
+Operational implants use a single persistence method. The features capture which method is used (one-hot encoded) and the infrastructure that supports it. Each method type has characteristic infrastructure — a `registry_run` method normally has 2–4 registry keys and 0 scheduled tasks, while a `scheduled_task` method has 0–1 registry keys and 1–3 tasks. These per-method ranges are hand-picked in the synthetic generator (`profiles.py`) and should be verified on real data.
 
 | Feature | Description | Typical Range |
 |---|---|---|
-| `active_method_count` | Number of active persistence methods (registry_run, scheduled_task, service_install, etc.). Drives the "depth" of persistence. | 1 – 3 |
-| `registry_key_count` | Number of registry keys used for persistence. In the synthetic baseline, this correlates with `active_method_count` because the generator uses depth-dependent lookup tables (hand-picked ranges per depth level). This correlation should be verified on real data. | 1 – 5 |
-| `scheduled_task_count` | Number of scheduled tasks created for persistence. Like registry keys, correlates with depth. | 0 – 3 |
-| `watchdog_enabled` | 1.0 if a watchdog process monitors persistence health, 0.0 otherwise. In the synthetic generator, this is enabled with 80% probability at depth 3 but only 10% at depth 1 (hand-picked values). | 0 or 1 |
-| `reinstall_on_removal` | 1.0 if the implant reinstalls itself when persistence is removed, 0.0 otherwise. Like watchdog, correlates with depth. | 0 or 1 |
-| `total_persistence_footprint` | `active_method_count + registry_key_count + scheduled_task_count`. A single number capturing overall persistence weight on the host. | 2 – 11 |
-| `safety_to_depth_ratio` | `(watchdog_enabled + reinstall_on_removal) / active_method_count`. Measures how much safety infrastructure exists per persistence method. In the synthetic generator, deep persistence (3 methods) has high safety (ratio ~0.5–0.7), while shallow persistence (1 method) has low safety (ratio ~0.0) — this correlation comes from the hand-picked depth-dependent probability tables in `profiles.py`. The `duplicated_persistence_setup` anomaly violates this: 1 method with both safety nets enabled (ratio = 2.0). | 0.0 – 1.0 |
+| `registry_key_count` | Number of registry keys used for persistence. Correlates with method type in the synthetic generator — `registry_run` uses 2–4 keys, other methods 0–1. | 0 – 4 |
+| `scheduled_task_count` | Number of scheduled tasks. `scheduled_task` method uses 1–3, `wmi_subscription` uses 1–2, others use 0. | 0 – 3 |
+| `watchdog_enabled` | 1.0 if a watchdog monitors persistence health. Probability varies by method type (hand-picked: 60% for `service_install`, 10% for `startup_folder`). | 0 or 1 |
+| `reinstall_on_removal` | 1.0 if auto-reinstall on removal. Like watchdog, probability is method-dependent (hand-picked). | 0 or 1 |
+| `total_persistence_footprint` | `registry_key_count + scheduled_task_count`. Overall infrastructure weight. | 0 – 7 |
+| `safety_net_count` | `watchdog_enabled + reinstall_on_removal`. How many safety mechanisms are active (0, 1, or 2). | 0 – 2 |
+| `method_registry_run` | 1.0 if the persistence method is `registry_run`, 0.0 otherwise. | 0 or 1 |
+| `method_scheduled_task` | 1.0 if the persistence method is `scheduled_task`. | 0 or 1 |
+| `method_service_install` | 1.0 if the persistence method is `service_install`. | 0 or 1 |
+| `method_startup_folder` | 1.0 if the persistence method is `startup_folder`. | 0 or 1 |
+| `method_wmi_subscription` | 1.0 if the persistence method is `wmi_subscription`. | 0 or 1 |
+
+The one-hot method encoding lets the ML models learn per-method infrastructure expectations. The `duplicated_persistence_setup` anomaly creates a `registry_run` method with 0 registry keys and 3–5 scheduled tasks — infrastructure that belongs to a `scheduled_task` setup, not a registry one.
 
 #### Capability Configuration (9 features)
 
