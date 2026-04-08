@@ -288,7 +288,7 @@ Normal data points are surrounded by similar points and need many splits to isol
 
 Before training, features are:
 1. **Filtered by variance:** Features with variance below 0.001 are dropped (they carry no useful signal).
-2. **Standard-scaled:** Each feature is centered to mean=0 and scaled to std=1. This prevents features with large ranges (like beacon_interval_ms in the thousands) from dominating features with small ranges (like jitter_percentage around 0.15).
+2. **Standard-scaled:** Each feature is centered to mean=0 and scaled to std=1. Strictly speaking, **Isolation Forest does not need scaling** — tree-based models split one feature at a time and never compute cross-feature distances, so they are inherently scale-invariant. We scale anyway because LOF (which shares the same training matrix) *does* need scaling, and using one consistent preprocessing path for all models simplifies the code and avoids bugs from maintaining separate scaled/unscaled pipelines.
 
 ### Strengths
 
