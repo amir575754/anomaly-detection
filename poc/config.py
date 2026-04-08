@@ -40,7 +40,7 @@ ISOLATION_FOREST_HIGH_THRESHOLD: float = 0.95
 ISOLATION_FOREST_MEDIUM_THRESHOLD: float = 0.90
 
 # Isolation Forest: number of trees in the ensemble
-ISOLATION_FOREST_ESTIMATORS: int = 500
+ISOLATION_FOREST_ESTIMATORS: int = 100
 
 # Isolation Forest: expected proportion of anomalies in training data
 ISOLATION_FOREST_CONTAMINATION: float | str = 0.02
@@ -112,10 +112,13 @@ RETRAIN_THRESHOLD: int = 100
 # ---------------------------------------------------------------------------
 
 # Seconds the detector sleeps when no backlog remains
-DETECTION_IDLE_SLEEP_SECONDS: int = 3
+DETECTION_IDLE_SLEEP_SECONDS: int = 1
 
 # Maximum telemetry rows scored per tick
 MAX_ROWS_PER_DETECTION_TICK: int = 5000
+
+# Maximum baselines retrained per tick (prevents long stalls on first tick)
+MAX_RETRAINS_PER_TICK: int = 5
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +141,7 @@ SNAPSHOTS_PER_IMPLANT_PER_DAY: int = 24
 LIVE_PHASE_MAX_EVENTS_PER_SECOND: int = 0
 
 # Maximum total events to generate during the live phase (0 = unlimited)
-LIVE_PHASE_MAX_EVENTS: int = 10_000
+LIVE_PHASE_MAX_EVENTS: int = 3_000
 
 # Fraction of expected baseline events before the generator considers ingestion complete
 INGESTOR_COMPLETION_THRESHOLD: float = 0.99

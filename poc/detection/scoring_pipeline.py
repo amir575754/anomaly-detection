@@ -22,6 +22,7 @@ from detection.output import print_detections
 from detection.queries import discover_window_keys, fetch_all_implants
 from detection.scoping import build_model_cache
 from detection.scoring import (
+    determine_severity,
     explain_isolation_forest,
     predict_anomaly,
     score_with_iqr,
@@ -73,9 +74,12 @@ def score_row_with_cache(
     lof_score = score_with_lof(features, trained_model)
     mahalanobis_p_value = trained_model.mahalanobis_p_value(features)
     if_predicts_anomaly, lof_predicts_anomaly = predict_anomaly(features, trained_model)
-    any_signal = if_predicts_anomaly or lof_predicts_anomaly or len(deviations) > 0
+
+    severity = determine_severity(
+        deviations, if_predicts_anomaly, lof_predicts_anomaly, mahalanobis_p_value,
+    )
     shap_contributions = (explain_isolation_forest(features, trained_model)
-                          if any_signal else [])
+                          if severity is not None else [])
     return ScoredEvent(
         telemetry_row=row, deviating_features=deviations,
         isolation_forest_score=isolation_forest_score, lof_score=lof_score,
@@ -110,11 +114,17 @@ def retrain_stale_baselines(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
 ) -> None:
-    """Check all window keys and retrain any baselines that need refreshing."""
+    """Check all window keys and retrain baselines that need refreshing.
+
+    Caps retrains at MAX_RETRAINS_PER_TICK to prevent long stalls —
+    remaining stale baselines will be caught on subsequent ticks.
+    """
     window_keys = discover_window_keys(redis_connection)
     retrained = 0
     failed_scopes: list[tuple[str, str, str]] = []
     for scope, scope_id, config_type in window_keys:
+        if retrained >= config.MAX_RETRAINS_PER_TICK:
+            break
         if not should_retrain(redis_connection, scope, scope_id, config_type):
             continue
         if try_retrain_baseline(redis_connection, db_connection, scope, scope_id, config_type) is None:
@@ -122,7 +132,7 @@ def retrain_stale_baselines(
         else:
             failed_scopes.append((scope, scope_id, config_type))
     if retrained > 0:
-        logger.info("Retrained %d / %d baselines this tick", retrained, len(window_keys))
+        logger.info("Retrained %d baselines this tick (cap=%d)", retrained, config.MAX_RETRAINS_PER_TICK)
     if failed_scopes:
         failed_keys = ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct in failed_scopes)
         logger.warning("%d baseline refresh(es) failed: %s", len(failed_scopes), failed_keys)
