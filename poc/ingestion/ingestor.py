@@ -94,10 +94,6 @@ def extract_payload(message) -> dict | None:
     return json.loads(message.value().decode("utf-8"))
 
 
-_IDLE_POLLS_BEFORE_FLUSH = 3
-_CONSUME_BATCH_SIZE = 100
-
-
 def consume_loop(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
@@ -105,9 +101,9 @@ def consume_loop(
 ) -> None:
     """Main consume-and-batch loop. Runs until interrupted.
 
-    Uses consume() to pull up to 100 messages per Kafka call instead of
-    polling one at a time. Flushes to storage when the batch reaches
-    INGESTOR_BATCH_SIZE or after a few consecutive empty polls.
+    Pulls up to INGESTOR_CONSUME_BATCH_SIZE messages per Kafka call instead
+    of polling one at a time. Flushes to storage when the batch reaches
+    INGESTOR_BATCH_SIZE or after INGESTOR_IDLE_POLLS_BEFORE_FLUSH empty polls.
     """
     processed = 0
     last_logged_at_count = 0
@@ -115,7 +111,7 @@ def consume_loop(
     batch: list[dict] = []
     while True:
         messages = consumer.consume(
-            num_messages=_CONSUME_BATCH_SIZE,
+            num_messages=config.INGESTOR_CONSUME_BATCH_SIZE,
             timeout=config.KAFKA_POLL_TIMEOUT_SECONDS,
         )
         if messages:
@@ -129,7 +125,7 @@ def consume_loop(
 
         should_flush = (
             len(batch) >= config.INGESTOR_BATCH_SIZE
-            or (batch and consecutive_empty_polls >= _IDLE_POLLS_BEFORE_FLUSH)
+            or (batch and consecutive_empty_polls >= config.INGESTOR_IDLE_POLLS_BEFORE_FLUSH)
         )
         if should_flush:
             processed += flush_and_clear_batch(db_connection, redis_connection, batch)

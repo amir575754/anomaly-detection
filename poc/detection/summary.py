@@ -56,9 +56,9 @@ class DetectionSummary:
             self.injector_detected[tag] += 1
             if event.deviating_features:
                 self.injector_detected_iqr[tag] += 1
-            if event.isolation_forest_score >= config.ISOLATION_FOREST_MEDIUM_THRESHOLD:
+            if event.isolation_forest_score >= config.ISOLATION_FOREST_REPORTING_THRESHOLD:
                 self.injector_detected_if[tag] += 1
-            if event.lof_score >= config.LOF_HIGH_THRESHOLD:
+            if event.lof_score >= config.LOF_REPORTING_THRESHOLD:
                 self.injector_detected_lof[tag] += 1
         else:
             self.false_positives += 1

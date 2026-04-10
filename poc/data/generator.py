@@ -73,15 +73,21 @@ def setup_generator() -> tuple[Producer, list[tuple[str, str]]]:
 
 def main() -> None:
     producer, implants = setup_generator()
-    logger.info("=== Baseline: generating synthetic history ===")
-    total_baseline_events = run_baseline_phase(producer, implants)
-    logger.info("=== Baseline: waiting for ingestor ===")
-    wait_for_ingestor(total_baseline_events)
-    logger.info("=== Baseline: bootstrapping models ===")
-    bootstrap_baselines()
-    save_baseline_cursor()
-    logger.info("=== Live: streaming with anomaly injection ===")
-    run_live_phase(producer, implants)
+    try:
+        logger.info("=== Baseline: generating synthetic history ===")
+        total_baseline_events = run_baseline_phase(producer, implants)
+        logger.info("=== Baseline: waiting for ingestor ===")
+        wait_for_ingestor(total_baseline_events)
+        logger.info("=== Baseline: bootstrapping models ===")
+        bootstrap_baselines()
+        save_baseline_cursor()
+        logger.info("=== Live: streaming with anomaly injection ===")
+        run_live_phase(producer, implants)
+    finally:
+        # Flush any queued messages before exit so partial baseline data
+        # isn't lost on error. Producer has no explicit close() — flush is
+        # sufficient for confluent_kafka cleanup.
+        producer.flush()
 
 
 if __name__ == "__main__":

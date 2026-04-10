@@ -33,11 +33,12 @@ IQR_SIGNIFICANT_MULTIPLIER: float = 3.0
 # Minimum number of IQR-deviating features for "significant" deviation
 IQR_SIGNIFICANT_FEATURE_COUNT: int = 2
 
-# Isolation Forest anomaly score threshold for HIGH severity
-ISOLATION_FOREST_HIGH_THRESHOLD: float = 0.95
-
-# Isolation Forest anomaly score threshold for MEDIUM severity
-ISOLATION_FOREST_MEDIUM_THRESHOLD: float = 0.90
+# Isolation Forest score threshold used by summary reporting to count an
+# event as "detected by IF" for per-injector statistics. Paired with
+# LOF_REPORTING_THRESHOLD so the two detector families are compared at the
+# same sensitivity level. Severity voting (determine_severity) does NOT use
+# this — it uses sklearn's predict() calibrated to ISOLATION_FOREST_CONTAMINATION.
+ISOLATION_FOREST_REPORTING_THRESHOLD: float = 0.90
 
 # Isolation Forest: number of trees in the ensemble
 ISOLATION_FOREST_ESTIMATORS: int = 100
@@ -57,8 +58,11 @@ LOF_N_NEIGHBORS: int = 20
 # LOF: expected proportion of anomalies in training data (controls predict() threshold)
 LOF_CONTAMINATION: float = 0.02
 
-# LOF anomaly score threshold (percentile-based, like IF)
-LOF_HIGH_THRESHOLD: float = 0.90
+# LOF score threshold used by summary reporting to count an event as
+# "detected by LOF" for per-injector statistics. Paired with
+# ISOLATION_FOREST_REPORTING_THRESHOLD so the two detector families are
+# compared at the same sensitivity level. Severity voting does NOT use this.
+LOF_REPORTING_THRESHOLD: float = 0.90
 
 # Mahalanobis p-value thresholds (lower = more anomalous)
 MAHALANOBIS_P_VALUE_HIGH: float = 0.001   # 0.1% chance under normal distribution
@@ -93,7 +97,10 @@ ZERO_IQR_EPSILON: float = 0.01
 # Minimum days of per-implant data before the implant baseline supersedes the group baseline
 IMPLANT_BASELINE_MIN_DAYS: int = 7
 
-# Maximum number of feature vectors kept per sliding window in Redis (used for ltrim)
+# Maximum number of feature vectors kept per sliding window in Redis (used
+# for ltrim by the ingestor). Must be >= max(BASELINE_WINDOW_SIZE_GROUP,
+# BASELINE_WINDOW_SIZE_IMPLANT), otherwise the detector will train on fewer
+# samples than the per-scope configuration requests.
 BASELINE_WINDOW_SIZE: int = 1000
 
 # Effective training window size per scope — vectors are sliced before training
@@ -119,6 +126,14 @@ MAX_ROWS_PER_DETECTION_TICK: int = 5000
 
 # Maximum baselines retrained per tick (0 = unlimited)
 MAX_RETRAINS_PER_TICK: int = 0
+
+# Exponential back-off applied after a failed detection tick. Sleep is
+# min(consecutive_failures * DETECTOR_BACKOFF_PER_FAILURE_SECONDS,
+#     DETECTOR_BACKOFF_MAX_SECONDS)
+# so the loop keeps retrying but doesn't hammer PostgreSQL/Redis on a
+# persistent fault.
+DETECTOR_BACKOFF_PER_FAILURE_SECONDS: float = 5.0
+DETECTOR_BACKOFF_MAX_SECONDS: float = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +183,11 @@ KAFKA_POLL_TIMEOUT_SECONDS: float = 0.05
 
 # Number of processed messages between progress log lines
 INGESTOR_LOG_INTERVAL_MESSAGES: int = 2000
+
+# Maximum messages pulled from Kafka in one consume() call (amortises per-call
+# overhead compared to single-message poll())
+INGESTOR_CONSUME_BATCH_SIZE: int = 100
+
+# Consecutive empty polls before flushing a partial batch — prevents the tail
+# of a stream from getting stuck in the in-memory batch forever
+INGESTOR_IDLE_POLLS_BEFORE_FLUSH: int = 3

@@ -16,7 +16,6 @@ from rich.table import Table
 from rich.text import Text
 
 from detection.models import ScoredEvent, Severity
-from detection.scoring import determine_severity
 from detection.summary import DetectionSummary
 
 logger = logging.getLogger(__name__)
@@ -133,24 +132,23 @@ def _build_panel(event: ScoredEvent, severity: Severity) -> Panel:
 
 
 def print_detections(scored_events: list[ScoredEvent]) -> int:
-    """Determine severity and print detected anomalies. Returns count printed."""
+    """Print detected anomalies. Returns count printed.
+
+    Severity is read from the event (computed once in scoring_pipeline) so
+    this function and the scoring loop can never disagree on whether an
+    event is an alert.
+    """
     summary = DetectionSummary()
     summary.total_scored = len(scored_events)
     for event in scored_events:
         summary.record_scored(event)
-        severity = determine_severity(
-            event.deviating_features,
-            event.if_predicts_anomaly,
-            event.lof_predicts_anomaly,
-            event.mahalanobis_p_value,
-        )
-        if severity is None:
+        if event.severity is None:
             row = event.telemetry_row
             if row.get("is_anomaly") and row.get("injector_tag"):
                 summary.record_miss(event)
             continue
-        console.print(_build_panel(event, severity))
-        summary.record(event, severity)
+        console.print(_build_panel(event, event.severity))
+        summary.record(event, event.severity)
     if summary.total_scored > 0:
         summary.print_summary()
     return summary.total_printed

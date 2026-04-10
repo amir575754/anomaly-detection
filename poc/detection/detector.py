@@ -86,7 +86,10 @@ def execute_tick(
         return last_processed_id, has_more, 0
     except Exception:
         consecutive_failures += 1
-        backoff = min(consecutive_failures * 5, 30)
+        backoff = min(
+            consecutive_failures * config.DETECTOR_BACKOFF_PER_FAILURE_SECONDS,
+            config.DETECTOR_BACKOFF_MAX_SECONDS,
+        )
         logger.warning(
             "Tick #%d failed (%d consecutive) — backing off %.0fs",
             tick_number, consecutive_failures, backoff, exc_info=True,

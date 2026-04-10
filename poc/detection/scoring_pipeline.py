@@ -88,6 +88,7 @@ def score_row_with_cache(
         lof_predicts_anomaly=lof_predicts_anomaly,
         baseline_used=scope,
         shap_contributions=shap_contributions,
+        severity=severity,
     )
 
 

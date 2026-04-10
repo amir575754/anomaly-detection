@@ -70,9 +70,3 @@ def fetch_unscored_telemetry(
     return rows
 
 
-def get_max_telemetry_id(db_connection: psycopg2.extensions.connection) -> int:
-    """Return the current maximum telemetry ID, or 0 if the table is empty."""
-    with db_connection.cursor() as cursor:
-        cursor.execute("SELECT COALESCE(MAX(id), 0) FROM telemetry")
-        row = cursor.fetchone()
-        return row[0] if row else 0

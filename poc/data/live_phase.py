@@ -106,6 +106,11 @@ def stream_live_rounds(producer: Producer, implants: list[tuple[str, str]]) -> N
     total_anomalies = 0
     window_start = time.monotonic()
     window_count = 0
+    # Tracks the next event count at which we should emit a progress log.
+    # Using a threshold variable rather than modulo arithmetic because each
+    # round publishes len(implants) events at once, so total_published jumps
+    # in steps that may skip over an exact multiple of the log interval.
+    next_log_at = config.INGESTOR_LOG_INTERVAL_MESSAGES
     while True:
         total_published, total_anomalies, window_start, window_count, capped = (
             publish_live_round(
@@ -117,9 +122,10 @@ def stream_live_rounds(producer: Producer, implants: list[tuple[str, str]]) -> N
             producer.flush()
             log_live_summary(total_published, total_anomalies, "reached event cap")
             return
-        if total_published % config.INGESTOR_LOG_INTERVAL_MESSAGES == 0:
+        if total_published >= next_log_at:
             producer.flush()
             log_live_summary(total_published, total_anomalies, "progress")
+            next_log_at += config.INGESTOR_LOG_INTERVAL_MESSAGES
 
 
 def run_live_phase(producer: Producer, implants: list[tuple[str, str]]) -> None:
