@@ -19,17 +19,6 @@ import config  # noqa: E402 — path setup required before import
 logger = logging.getLogger(__name__)
 
 
-def clamp_lower_fence(raw_lower: float, p1: float) -> float:
-    """Clamp the lower fence at P1 so it never extends below the training distribution.
-
-    Only the lower fence is clamped — this prevents fences from reaching into
-    impossible territory for narrow-range features (e.g. jitter_percentage).
-    The upper fence uses the raw IQR calculation to avoid guaranteed false
-    positives on the top percentile of normal values.
-    """
-    return max(raw_lower, p1)
-
-
 def compute_single_feature_fence(
     feature_vectors: list[dict[str, float]],
     feature_name: str,
@@ -37,22 +26,49 @@ def compute_single_feature_fence(
 ) -> dict:
     """Compute Q1, Q3, IQR, median, and fences for one feature.
 
-    The lower fence is clamped at P1 so it never extends below the bulk of
-    the training distribution — this prevents narrow-range features (e.g.
-    jitter_percentage 0.10-0.25) from getting fences in impossible territory.
+    When IQR is zero (constant or near-constant features like booleans),
+    falls back to MAD (Median Absolute Deviation) scaled to approximate
+    the IQR. If MAD is also zero (truly constant feature), uses a tight
+    epsilon band around the median so any deviation is caught.
     """
     multiplier = iqr_multiplier if iqr_multiplier is not None else config.IQR_MULTIPLIER
     values = np.array([vector.get(feature_name, 0.0) for vector in feature_vectors])
-    p1, q1, median_value, q3 = np.percentile(values, [1, 25, 50, 75])
+    q1, median_value, q3 = np.percentile(values, [25, 50, 75])
     iqr = float(q3 - q1)
-    raw_lower = float(q1) - multiplier * iqr
+
+    if iqr > 0:
+        lower_fence = float(q1) - multiplier * iqr
+        upper_fence = float(q3) + multiplier * iqr
+    else:
+        mad = float(np.median(np.abs(values - median_value)))
+        if mad > 0:
+            pseudo_iqr = mad * 1.4826
+            iqr = pseudo_iqr
+            lower_fence = float(median_value) - multiplier * pseudo_iqr
+            upper_fence = float(median_value) + multiplier * pseudo_iqr
+        else:
+            val_min = float(np.min(values))
+            val_max = float(np.max(values))
+            if val_min < val_max:
+                # Feature varies in training but IQR and MAD are both 0 —
+                # use training range with a small margin as the fence.
+                data_range = val_max - val_min
+                iqr = data_range
+                lower_fence = val_min - config.ZERO_IQR_EPSILON
+                upper_fence = val_max + config.ZERO_IQR_EPSILON
+            else:
+                # Truly constant feature — any deviation is anomalous
+                iqr = config.ZERO_IQR_EPSILON
+                lower_fence = float(median_value) - config.ZERO_IQR_EPSILON
+                upper_fence = float(median_value) + config.ZERO_IQR_EPSILON
+
     return {
         "Q1": float(q1),
         "Q3": float(q3),
         "IQR": iqr,
         "median": float(median_value),
-        "lower_fence": clamp_lower_fence(raw_lower, float(p1)),
-        "upper_fence": float(q3) + multiplier * iqr,
+        "lower_fence": lower_fence,
+        "upper_fence": upper_fence,
     }
 
 
@@ -86,16 +102,16 @@ def filter_low_variance_features(
     feature_names: list[str],
 ) -> list[str]:
     """Return only features whose variance exceeds FEATURE_VARIANCE_THRESHOLD."""
-    active = []
+    retained_features = []
     for name in feature_names:
         values = [vector.get(name, 0.0) for vector in feature_vectors]
         variance = np.var(values)
         if variance >= config.FEATURE_VARIANCE_THRESHOLD:
-            active.append(name)
+            retained_features.append(name)
         else:
             logger.debug("Dropping low-variance feature %r (variance=%.6f)", name, variance)
     logger.debug(
         "Feature filter: %d/%d features retained (threshold=%.4f)",
-        len(active), len(feature_names), config.FEATURE_VARIANCE_THRESHOLD,
+        len(retained_features), len(feature_names), config.FEATURE_VARIANCE_THRESHOLD,
     )
-    return active
+    return retained_features

@@ -31,7 +31,7 @@ def resolve_baseline_scope(
     Determine whether to use the per-implant or per-group baseline.
     Returns (scope, scope_id).
     """
-    days_since_first_seen = (now - first_seen).total_seconds() / config.SECONDS_PER_DAY
+    days_since_first_seen = (now - first_seen).total_seconds() / 86_400
 
     if days_since_first_seen >= config.IMPLANT_BASELINE_MIN_DAYS:
         implant_model_key = f"model:implant:{implant_id}:{config_type}"

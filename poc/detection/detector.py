@@ -49,9 +49,12 @@ def run_single_tick(
 def wait_for_baseline_cursor(redis_connection: redis_module.Redis) -> int:
     """Poll Redis until the baseline cursor exists. Returns last_processed_id."""
     baseline_cursor = redis_connection.get("detector:baseline_cursor")
+    logged_once = False
     while baseline_cursor is None:
-        logger.info("Waiting for baseline phase to complete (no cursor in Redis yet)...")
-        time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
+        if not logged_once:
+            logger.info("Waiting for baseline phase to complete...")
+            logged_once = True
+        time.sleep(1)
         baseline_cursor = redis_connection.get("detector:baseline_cursor")
     last_processed_id = int(baseline_cursor)
     logger.info("Baseline cursor found — starting detection from telemetry id %d", last_processed_id)
@@ -83,7 +86,10 @@ def execute_tick(
         return last_processed_id, has_more, 0
     except Exception:
         consecutive_failures += 1
-        backoff = min(consecutive_failures * 5, 30)
+        backoff = min(
+            consecutive_failures * config.DETECTOR_BACKOFF_PER_FAILURE_SECONDS,
+            config.DETECTOR_BACKOFF_MAX_SECONDS,
+        )
         logger.warning(
             "Tick #%d failed (%d consecutive) — backing off %.0fs",
             tick_number, consecutive_failures, backoff, exc_info=True,
@@ -103,11 +109,13 @@ def run_tick_loop(
     while True:
         tick_number += 1
         tick_start = time.monotonic()
-        logger.info("=== Tick #%d ===", tick_number)
+        logger.debug("=== Tick #%d ===", tick_number)
         last_processed_id, has_more, consecutive_failures = execute_tick(
             db_connection, redis_connection, last_processed_id, tick_number, consecutive_failures,
         )
-        logger.info("Tick #%d done in %.1fs", tick_number, time.monotonic() - tick_start)
+        elapsed = time.monotonic() - tick_start
+        if elapsed > 2.0:
+            logger.info("Tick #%d done in %.1fs", tick_number, elapsed)
         if not has_more:
             time.sleep(config.DETECTION_IDLE_SLEEP_SECONDS)
 

@@ -22,9 +22,12 @@ from detection.output import print_detections
 from detection.queries import discover_window_keys, fetch_all_implants
 from detection.scoping import build_model_cache
 from detection.scoring import (
+    determine_severity,
     explain_isolation_forest,
+    predict_anomaly,
     score_with_iqr,
     score_with_isolation_forest,
+    score_with_lof,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,7 +45,7 @@ def resolve_cached_model(
     scope_map: dict[tuple, tuple],
     model_cache: dict[tuple, dict | None],
 ) -> tuple[str, dict] | None:
-    """Look up the baseline scope and cached model for a row. Returns (scope, model) or None."""
+    """Look up the baseline scope and cached artefacts for a row. Returns (scope, artefacts_dict) or None."""
     scope_entry = scope_map.get((row["implant_id"], row["config_type"]))
     if scope_entry is None:
         return None
@@ -65,15 +68,27 @@ def score_row_with_cache(
         return None
     scope, cached_model = resolved
 
+    deviations, _soft_deviation_count = score_with_iqr(features, cached_model["iqr_fences"])
     trained_model = cached_model["trained_model"]
-    deviations = score_with_iqr(features, cached_model["iqr_fences"])
     isolation_forest_score = score_with_isolation_forest(features, trained_model)
+    lof_score = score_with_lof(features, trained_model)
+    mahalanobis_p_value = trained_model.mahalanobis_p_value(features)
+    if_predicts_anomaly, lof_predicts_anomaly = predict_anomaly(features, trained_model)
+
+    severity = determine_severity(
+        deviations, if_predicts_anomaly, lof_predicts_anomaly, mahalanobis_p_value,
+    )
     shap_contributions = (explain_isolation_forest(features, trained_model)
-                          if isolation_forest_score >= config.ISOLATION_FOREST_MEDIUM_THRESHOLD else [])
+                          if severity is not None else [])
     return ScoredEvent(
         telemetry_row=row, deviating_features=deviations,
-        isolation_forest_score=isolation_forest_score, baseline_used=scope,
+        isolation_forest_score=isolation_forest_score, lof_score=lof_score,
+        mahalanobis_p_value=mahalanobis_p_value,
+        if_predicts_anomaly=if_predicts_anomaly,
+        lof_predicts_anomaly=lof_predicts_anomaly,
+        baseline_used=scope,
         shap_contributions=shap_contributions,
+        severity=severity,
     )
 
 
@@ -100,22 +115,29 @@ def retrain_stale_baselines(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
 ) -> None:
-    """Check all window keys and retrain any baselines that need refreshing."""
+    """Check all window keys and retrain baselines that need refreshing.
+
+    Caps retrains at MAX_RETRAINS_PER_TICK to prevent long stalls —
+    remaining stale baselines will be caught on subsequent ticks.
+    """
     window_keys = discover_window_keys(redis_connection)
     retrained = 0
-    failures: list[tuple[str, str, str]] = []
+    failed_scopes: list[tuple[str, str, str]] = []
+    cap = config.MAX_RETRAINS_PER_TICK
     for scope, scope_id, config_type in window_keys:
+        if cap > 0 and retrained >= cap:
+            break
         if not should_retrain(redis_connection, scope, scope_id, config_type):
             continue
         if try_retrain_baseline(redis_connection, db_connection, scope, scope_id, config_type) is None:
             retrained += 1
         else:
-            failures.append((scope, scope_id, config_type))
+            failed_scopes.append((scope, scope_id, config_type))
     if retrained > 0:
-        logger.info("Retrained %d / %d baselines this tick", retrained, len(window_keys))
-    if failures:
-        failed_keys = ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct in failures)
-        logger.warning("%d baseline refresh(es) failed: %s", len(failures), failed_keys)
+        logger.info("Retrained %d baselines this tick (cap=%d)", retrained, config.MAX_RETRAINS_PER_TICK)
+    if failed_scopes:
+        failed_keys = ", ".join(f"{s}:{sid}:{ct}" for s, sid, ct in failed_scopes)
+        logger.warning("%d baseline refresh(es) failed: %s", len(failed_scopes), failed_keys)
 
 
 def try_score_row(
@@ -143,8 +165,10 @@ def score_all_rows(
         scored = try_score_row(row, scope_map, model_cache)
         if scored is not None:
             scored_events.append(scored)
-        elif row.get("id") is not None:
-            failure_ids.append(row.get("id"))
+        else:
+            row_id = row.get("id")
+            if row_id is not None:
+                failure_ids.append(row_id)
     if failure_ids:
         logger.warning(
             "%d row(s) failed scoring: %s",

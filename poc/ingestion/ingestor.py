@@ -94,34 +94,42 @@ def extract_payload(message) -> dict | None:
     return json.loads(message.value().decode("utf-8"))
 
 
-def should_flush_batch(payload, batch: list[dict]) -> bool:
-    """Return True if the batch should be flushed to storage."""
-    if len(batch) >= config.INGESTOR_BATCH_SIZE:
-        return True
-    if payload is None and batch:
-        logger.debug(
-            "Idle flush: %d messages pending (below batch size %d)",
-            len(batch), config.INGESTOR_BATCH_SIZE,
-        )
-        return True
-    return False
-
-
 def consume_loop(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
     consumer: Consumer,
 ) -> None:
-    """Main consume-and-batch loop. Runs until interrupted."""
+    """Main consume-and-batch loop. Runs until interrupted.
+
+    Pulls up to INGESTOR_CONSUME_BATCH_SIZE messages per Kafka call instead
+    of polling one at a time. Flushes to storage when the batch reaches
+    INGESTOR_BATCH_SIZE or after INGESTOR_IDLE_POLLS_BEFORE_FLUSH empty polls.
+    """
     processed = 0
     last_logged_at_count = 0
+    consecutive_empty_polls = 0
     batch: list[dict] = []
     while True:
-        payload = extract_payload(consumer.poll(timeout=config.KAFKA_POLL_TIMEOUT_SECONDS))
-        if payload is not None:
-            batch.append(payload)
-        if should_flush_batch(payload, batch):
+        messages = consumer.consume(
+            num_messages=config.INGESTOR_CONSUME_BATCH_SIZE,
+            timeout=config.KAFKA_POLL_TIMEOUT_SECONDS,
+        )
+        if messages:
+            consecutive_empty_polls = 0
+            for message in messages:
+                payload = extract_payload(message)
+                if payload is not None:
+                    batch.append(payload)
+        else:
+            consecutive_empty_polls += 1
+
+        should_flush = (
+            len(batch) >= config.INGESTOR_BATCH_SIZE
+            or (batch and consecutive_empty_polls >= config.INGESTOR_IDLE_POLLS_BEFORE_FLUSH)
+        )
+        if should_flush:
             processed += flush_and_clear_batch(db_connection, redis_connection, batch)
+            consecutive_empty_polls = 0
         if processed - last_logged_at_count >= config.INGESTOR_LOG_INTERVAL_MESSAGES:
             logger.info("Processed %d messages total", processed)
             last_logged_at_count = processed

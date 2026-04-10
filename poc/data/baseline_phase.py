@@ -170,15 +170,21 @@ def try_refresh_single_baseline(
 
 
 def bootstrap_baselines() -> None:
-    """Refresh baselines for all window keys populated during ingestion."""
+    """Refresh group-level baselines only for fast startup.
+
+    Per-implant baselines are trained lazily by the detector on its first
+    tick — this cuts bootstrap from ~90 models to ~15, saving over a minute.
+    """
     logger.info("Connecting to PostgreSQL and Redis for baseline bootstrap")
     db_connection = psycopg2.connect(config.DATABASE_DSN)
     redis_connection = redis_module.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False
     )
     try:
-        raw_keys = list(redis_connection.scan_iter(match="window:*"))
-        logger.info("Bootstrapping baselines for %d window keys", len(raw_keys))
+        raw_keys = [
+            k for k in redis_connection.scan_iter(match="window:group:*")
+        ]
+        logger.info("Bootstrapping %d group baselines (per-implant deferred to detector)", len(raw_keys))
         results = [try_refresh_single_baseline(redis_connection, db_connection, k) for k in raw_keys]
         succeeded = sum(results)
         logger.info(
