@@ -30,29 +30,3 @@ CREATE TABLE IF NOT EXISTS baselines (
     stats        JSONB NOT NULL,
     PRIMARY KEY (scope, scope_id, config_type)
 );
-
-CREATE TABLE IF NOT EXISTS alerts (
-    alert_id      UUID PRIMARY KEY,
-    implant_id    TEXT NOT NULL,
-    group_id      TEXT NOT NULL,
-    config_type   TEXT NOT NULL,
-    timestamp     TIMESTAMPTZ NOT NULL,
-    window_start  TIMESTAMPTZ NOT NULL,
-    window_end    TIMESTAMPTZ NOT NULL,
-    severity      TEXT NOT NULL,
-    baseline_used TEXT NOT NULL,
-    details       JSONB NOT NULL,
-    explanation   TEXT NOT NULL,
-    label         TEXT,
-    labeled_at    TIMESTAMPTZ
-);
-
-CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts (timestamp DESC);
-CREATE INDEX IF NOT EXISTS idx_alerts_implant ON alerts (implant_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_alerts_pattern ON alerts ((details->>'pattern_hash'));
-
-CREATE TABLE IF NOT EXISTS suppressed_patterns (
-    pattern_hash  TEXT PRIMARY KEY,
-    suppressed_at TIMESTAMPTZ NOT NULL,
-    label_count   INT NOT NULL DEFAULT 3
-);

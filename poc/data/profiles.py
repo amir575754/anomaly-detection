@@ -2,6 +2,11 @@
 Synthetic config snapshot generators. Produces clean (non-anomalous) telemetry
 representative of normal implant behaviour. Used by the generator for the
 baseline phase and as the base for live-phase events.
+
+Features within each config type are correlated — not independently drawn.
+This gives Isolation Forest learnable multivariate structure: normal data
+occupies a restricted submanifold, and anomalies that violate the correlations
+land off-manifold.
 """
 
 import random
@@ -35,6 +40,8 @@ _CAPABILITY_NAMES = [
     "lateral_movement", "credential_harvesting", "persistence", "network_scan",
 ]
 
+_SURVEILLANCE_CAPABILITIES = {"keylogging", "screenshot"}
+
 _PERSISTENCE_METHODS = [
     "registry_run", "scheduled_task", "service_install",
     "startup_folder", "wmi_subscription",
@@ -45,24 +52,59 @@ _EVASION_FLAGS = [
     "unhook_ntdll", "sleep_obfuscation", "stack_spoof",
 ]
 
+_POSTURE_ACTIONS = {
+    "stealth": "do_nothing",
+    "defensive": "self_destruct",
+    "monitoring": "audit",
+}
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
+
+
+def _clamp_int(value: float, low: int, high: int) -> int:
+    return max(low, min(high, round(value)))
+
+
+# ---------------------------------------------------------------------------
+# Dangerous program configuration — shared posture template
+# ---------------------------------------------------------------------------
+
+def _pick_posture_action(dominant_action: str) -> str:
+    """70% chance of the dominant action, 30% split among the other two."""
+    if random.random() < 0.70:
+        return dominant_action
+    return random.choice([a for a in _ACTIONS if a != dominant_action])
+
 
 def _generate_dangerous_program_configuration() -> dict:
+    posture = random.choices(
+        ["stealth", "defensive", "monitoring"],
+        weights=[0.35, 0.30, 0.35],
+        k=1,
+    )[0]
+    dominant_action = _POSTURE_ACTIONS[posture]
+
     programs = random.sample(_DANGEROUS_PROGRAMS, k=random.randint(2, 5))
     drivers = random.sample(_DANGEROUS_DRIVERS, k=random.randint(1, 4))
     return {
         "dangerous_programs": [
-            {"name": program, "action": random.choice(_ACTIONS)}
-            for program in programs
+            {"name": p, "action": _pick_posture_action(dominant_action)}
+            for p in programs
         ],
         "dangerous_drivers": [
-            {"name": driver, "action": random.choice(_ACTIONS)}
-            for driver in drivers
+            {"name": d, "action": _pick_posture_action(dominant_action)}
+            for d in drivers
         ],
     }
 
 
+# ---------------------------------------------------------------------------
+# Communication configuration — beacon-driven manifold
+# ---------------------------------------------------------------------------
+
 def _default_port_for_protocol(protocol: str) -> int:
-    """Return the default or random port for a given C2 protocol."""
     if protocol == "https":
         return 443
     if protocol == "dns":
@@ -79,44 +121,160 @@ def _generate_c2_channel(protocol: str) -> dict:
 
 
 def _generate_communication_configuration() -> dict:
+    beacon_interval_ms = random.randint(25000, 35000)
+    normalized = (beacon_interval_ms - 25000) / 10000.0
+
+    jitter_base = 0.25 - normalized * 0.15
+    jitter_percentage = round(_clamp(jitter_base + random.gauss(0, 0.02), 0.10, 0.25), 2)
+
+    max_retries = _clamp_int(3 + normalized * 4 + random.gauss(0, 0.5), 3, 7)
+    sleep_on_failure_ms = _clamp_int(
+        5000 + normalized * 10000 + random.gauss(0, 1000), 5000, 15000,
+    )
+
+    key_rotation_hours = _clamp_int(
+        12 + normalized * 36 + random.gauss(0, 3), 12, 48,
+    )
+
     protocols = random.sample(_C2_PROTOCOLS, k=random.randint(1, 3))
     return {
-        "beacon_interval_ms": random.randint(25000, 35000),
-        "jitter_percentage": round(random.uniform(0.10, 0.25), 2),
-        "max_retries": random.randint(3, 7),
-        "sleep_on_failure_ms": random.randint(5000, 15000),
+        "beacon_interval_ms": beacon_interval_ms,
+        "jitter_percentage": jitter_percentage,
+        "max_retries": max_retries,
+        "sleep_on_failure_ms": sleep_on_failure_ms,
         "c2_channels": [_generate_c2_channel(protocol) for protocol in protocols],
-        "encryption": {"enabled": True, "key_rotation_hours": random.randint(12, 48)},
+        "encryption": {"enabled": True, "key_rotation_hours": key_rotation_hours},
     }
+
+
+# ---------------------------------------------------------------------------
+# Persistence configuration — method-type-driven correlations
+# ---------------------------------------------------------------------------
+
+# Each method type has characteristic infrastructure: registry-heavy methods
+# use more registry keys, task-based methods use more scheduled tasks.
+_METHOD_REGISTRY_RANGE = {
+    "registry_run": (2, 4),
+    "scheduled_task": (0, 1),
+    "service_install": (1, 2),
+    "startup_folder": (0, 1),
+    "wmi_subscription": (0, 1),
+}
+_METHOD_TASK_RANGE = {
+    "registry_run": (0, 0),
+    "scheduled_task": (1, 3),
+    "service_install": (0, 1),
+    "startup_folder": (0, 0),
+    "wmi_subscription": (1, 2),
+}
+_METHOD_WATCHDOG_PROB = {
+    "registry_run": 0.30,
+    "scheduled_task": 0.25,
+    "service_install": 0.60,
+    "startup_folder": 0.10,
+    "wmi_subscription": 0.40,
+}
+_METHOD_REINSTALL_PROB = {
+    "registry_run": 0.20,
+    "scheduled_task": 0.15,
+    "service_install": 0.50,
+    "startup_folder": 0.05,
+    "wmi_subscription": 0.30,
+}
 
 
 def _generate_persistence_configuration() -> dict:
-    methods = random.sample(_PERSISTENCE_METHODS, k=random.randint(1, 3))
+    method = random.choice(_PERSISTENCE_METHODS)
+
+    reg_low, reg_high = _METHOD_REGISTRY_RANGE[method]
+    task_low, task_high = _METHOD_TASK_RANGE[method]
+
     return {
-        "active_methods": methods,
-        "registry_key_count": random.randint(1, 5),
-        "scheduled_task_count": random.randint(0, 3),
-        "watchdog_enabled": random.random() < 0.4,
-        "reinstall_on_removal": random.random() < 0.3,
+        "active_methods": [method],
+        "registry_key_count": random.randint(reg_low, reg_high),
+        "scheduled_task_count": random.randint(task_low, task_high),
+        "watchdog_enabled": random.random() < _METHOD_WATCHDOG_PROB[method],
+        "reinstall_on_removal": random.random() < _METHOD_REINSTALL_PROB[method],
     }
 
+
+# ---------------------------------------------------------------------------
+# Capability configuration — two-cluster posture (surveillance vs passive)
+# ---------------------------------------------------------------------------
 
 def _generate_capability_configuration() -> dict:
+    is_surveillance = random.random() < 0.35
     capabilities = list(_CAPABILITY_NAMES)
     random.shuffle(capabilities)
+
+    if is_surveillance:
+        enabled_set = _pick_surveillance_capabilities(capabilities)
+        concurrency_low = max(2, min(6, len(enabled_set) - 1))
+        concurrency_high = max(concurrency_low, min(6, len(enabled_set) + 1))
+        max_concurrent_tasks = random.randint(concurrency_low, concurrency_high)
+        task_timeout_ms = random.randint(30000, 60000)
+    else:
+        enabled_set = _pick_passive_capabilities(capabilities)
+        max_concurrent_tasks = random.randint(2, max(2, min(4, len(enabled_set) + 1)))
+        task_timeout_ms = random.randint(70000, 120000)
+
     return {
         "capabilities": [
-            {"name": capability, "enabled": random.random() < 0.4}
-            for capability in capabilities
+            {"name": cap, "enabled": cap in enabled_set}
+            for cap in capabilities
         ],
-        "max_concurrent_tasks": random.randint(2, 6),
-        "task_timeout_ms": random.randint(30000, 120000),
+        "max_concurrent_tasks": max_concurrent_tasks,
+        "task_timeout_ms": task_timeout_ms,
     }
 
 
-def _generate_evasion_configuration() -> dict:
-    return {flag: random.random() < 0.4 for flag in _EVASION_FLAGS}
+def _pick_surveillance_capabilities(capabilities: list[str]) -> set[str]:
+    enabled = set()
+    for cap in capabilities:
+        prob = 0.85 if cap in _SURVEILLANCE_CAPABILITIES else 0.30
+        if random.random() < prob:
+            enabled.add(cap)
+    if len(enabled) < 2:
+        enabled.update(random.sample(sorted(_SURVEILLANCE_CAPABILITIES), k=2 - len(enabled)))
+    return enabled
 
+
+def _pick_passive_capabilities(capabilities: list[str]) -> set[str]:
+    enabled = set()
+    for cap in capabilities:
+        prob = 0.10 if cap in _SURVEILLANCE_CAPABILITIES else 0.35
+        if random.random() < prob:
+            enabled.add(cap)
+    return enabled
+
+
+# ---------------------------------------------------------------------------
+# Evasion configuration — layered dependency chain
+# ---------------------------------------------------------------------------
+
+def _generate_evasion_configuration() -> dict:
+    obfuscate = random.random() < 0.55
+    amsi = (obfuscate and random.random() < 0.65) or (not obfuscate and random.random() < 0.08)
+    etw = random.random() < 0.50
+    unhook = (etw and random.random() < 0.65) or (not etw and random.random() < 0.12)
+
+    layer2_count = sum([amsi, etw, unhook])
+    sleep_obf = (layer2_count >= 2 and random.random() < 0.65) or (layer2_count < 2 and random.random() < 0.08)
+    stack = (sleep_obf and random.random() < 0.55) or (not sleep_obf and random.random() < 0.05)
+
+    return {
+        "obfuscate_strings": obfuscate,
+        "amsi_bypass_enabled": amsi,
+        "etw_patch_enabled": etw,
+        "unhook_ntdll": unhook,
+        "sleep_obfuscation": sleep_obf,
+        "stack_spoof": stack,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Snapshot assembly
+# ---------------------------------------------------------------------------
 
 _GENERATORS = {
     "dangerous_program_configuration": _generate_dangerous_program_configuration,

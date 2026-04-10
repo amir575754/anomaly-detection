@@ -22,12 +22,7 @@ import config
 from ingestion.parser import prepare_batch_rows
 from ingestion.writers import write_to_postgresql, write_to_redis
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
 
 
 def flush_batch(
@@ -61,12 +56,12 @@ def make_consumer() -> Consumer:
     return consumer
 
 
-def flush_if_needed(
+def flush_and_clear_batch(
     db_connection: psycopg2.extensions.connection,
     redis_connection: redis_module.Redis,
     batch: list[dict],
 ) -> int:
-    """Flush the batch if non-empty; return number of messages flushed."""
+    """Flush the batch to storage and clear it. Returns number of messages flushed."""
     if not batch:
         return 0
     flush_batch(db_connection, redis_connection, batch)
@@ -104,30 +99,37 @@ def consume_loop(
     redis_connection: redis_module.Redis,
     consumer: Consumer,
 ) -> None:
-    """Main consume-and-batch loop. Runs until interrupted."""
+    """Main consume-and-batch loop. Runs until interrupted.
+
+    Pulls up to INGESTOR_CONSUME_BATCH_SIZE messages per Kafka call instead
+    of polling one at a time. Flushes to storage when the batch reaches
+    INGESTOR_BATCH_SIZE or after INGESTOR_IDLE_POLLS_BEFORE_FLUSH empty polls.
+    """
     processed = 0
     last_logged_at_count = 0
+    consecutive_empty_polls = 0
     batch: list[dict] = []
-
     while True:
-        payload = extract_payload(
-            consumer.poll(timeout=config.KAFKA_POLL_TIMEOUT_SECONDS)
+        messages = consumer.consume(
+            num_messages=config.INGESTOR_CONSUME_BATCH_SIZE,
+            timeout=config.KAFKA_POLL_TIMEOUT_SECONDS,
         )
+        if messages:
+            consecutive_empty_polls = 0
+            for message in messages:
+                payload = extract_payload(message)
+                if payload is not None:
+                    batch.append(payload)
+        else:
+            consecutive_empty_polls += 1
 
-        if payload is not None:
-            batch.append(payload)
-
-        batch_is_full = len(batch) >= config.INGESTOR_BATCH_SIZE
-        idle_with_pending_data = payload is None and batch
-
-        if batch_is_full or idle_with_pending_data:
-            if idle_with_pending_data:
-                logger.debug(
-                    "Idle flush: %d messages pending (below batch size %d)",
-                    len(batch), config.INGESTOR_BATCH_SIZE,
-                )
-            processed += flush_if_needed(db_connection, redis_connection, batch)
-
+        should_flush = (
+            len(batch) >= config.INGESTOR_BATCH_SIZE
+            or (batch and consecutive_empty_polls >= config.INGESTOR_IDLE_POLLS_BEFORE_FLUSH)
+        )
+        if should_flush:
+            processed += flush_and_clear_batch(db_connection, redis_connection, batch)
+            consecutive_empty_polls = 0
         if processed - last_logged_at_count >= config.INGESTOR_LOG_INTERVAL_MESSAGES:
             logger.info("Processed %d messages total", processed)
             last_logged_at_count = processed
@@ -159,7 +161,15 @@ def run() -> None:
     finally:
         consumer.close()
         db_connection.close()
+        redis_connection.close()
 
 
 if __name__ == "__main__":
+    from rich.logging import RichHandler
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(name)s — %(message)s",
+        handlers=[RichHandler(rich_tracebacks=True, show_time=True)],
+    )
     run()
