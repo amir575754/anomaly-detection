@@ -36,9 +36,11 @@ This proof-of-concept demonstrates an **autonomous anomaly detection platform** 
 | Metric | Achieved | Target |
 |---|---|---|
 | Detection rate (true anomalies caught) | **90.0%** | >70% |
-| False positive rate (false alerts / total alerts) | **23.6%** | <40% |
-| Precision (true alerts / total alerts) | **76.4%** | — |
+| False positive rate (false alerts / total alerts) | **24.2%** | <40% |
+| Precision (true alerts / total alerts) | **75.8%** | — |
 | Per-injector detection (10 of 10 types) | **60–100%** | — |
+
+> Numbers measured via `poc/validate_detection.py` (`random.seed(42)`, 5000 events, 209 injected anomalies). Rerun the script to reproduce.
 
 ### What the Demo Shows
 
@@ -409,14 +411,15 @@ Each telemetry event is scored by four voting detectors:
 
 ### How predict() Reduces False Positives
 
-A critical innovation: instead of using continuous anomaly scores with thresholds (where 10% of clean data scores above the 90th percentile by definition), we use sklearn's `predict()` method which produces a binary yes/no decision calibrated to the contamination rate.
+A critical design choice: instead of using continuous anomaly scores with thresholds (where 10% of clean data scores above the 90th percentile by definition), we use sklearn's `predict()` method for the IF and LOF votes — a binary yes/no decision calibrated to the contamination rate. The Mahalanobis vote uses a p-value threshold (`p < 0.01`) which has the same "fraction of clean data flagged" interpretation.
 
 With `contamination=0.02`:
 - IF's `predict()` flags ~2% of training data as anomalous
 - LOF's `predict()` flags ~2% of training data as anomalous
-- The probability of BOTH independently flagging the same clean data point is approximately 0.04% (assuming independence)
+- Mahalanobis `p < 0.01` flags ~1% of normal data by construction
+- The probability of any two of the three independently flagging the same clean data point is approximately 0.04% (assuming independence)
 
-This gives us a structural FP guarantee: **requiring both ML models to agree limits ML-driven false positives to under 0.1% of clean events.**
+This gives us a structural FP guarantee: **requiring 2-of-3 ML families to agree limits ML-driven false positives to a fraction of a percent of clean events, before IQR corroboration further tightens it.**
 
 ### Scoring Pipeline (Per Event)
 
@@ -435,7 +438,9 @@ mahalanobis_p_value = chi2_pvalue(mahal_distance_squared, df=n_features)
 shap_contributions = TreeExplainer.shap_values(scaled_vector)
 
 # 5. Severity classification via corroboration voting
-severity = determine_severity(deviations, if_pred, lof_pred, ...)
+severity = determine_severity(
+    deviations, if_pred, lof_pred, mahalanobis_p_value,
+)
 ```
 
 ---
@@ -464,7 +469,7 @@ New vectors are appended on every ingestion. Old vectors are trimmed automatical
 The detector monitors a **write counter** per window. When 100+ new vectors have arrived since the last training, it retrains:
 1. Reads the full sliding window from Redis
 2. Recomputes IQR fences
-3. Refits Isolation Forest (500 trees)
+3. Refits Isolation Forest (100 trees, see `ISOLATION_FOREST_ESTIMATORS`)
 4. Refits LOF (20 neighbors)
 5. Recomputes Mahalanobis parameters (mean + inverse covariance)
 6. Caches everything back to Redis
@@ -504,25 +509,25 @@ However, per-implant baselines have much higher FP rates because with fewer trai
 
 ```
 +-- HIGH implant_ALPHA_003 (ALPHA) communication_configuration --+
-| IQR Deviations:                                                 |
-|   beacon_interval_ms    1200    (expected 15000-45000, median   |
-|                                  30100)                         |
-|   jitter_percentage     0.00    (expected 0.10-0.25, median     |
-|                                  0.18)                          |
+| IQR Deviations [FLAGGED]:                                       |
+|   beacon_interval_ms    1200   (expected 17000-43000, median    |
+|                                 29900)                          |
+|   jitter_percentage     0.00   (expected 0.10-0.25, median      |
+|                                 0.18)                           |
 | SHAP Contributions:                                             |
-|   beacon_interval_ms   +0.928                                   |
-|   jitter_percentage    +0.340                                   |
-| IF: 0.987  LOF: 0.943  Mahal p: 2.1e-08                       |
+|   beacon_interval_ms   -0.623  anomalous                        |
+|   sleep_on_failure_ms  -0.367  anomalous                        |
+| IF: 0.987 [FLAGGED]  LOF: 0.943 [FLAGGED]  Mahal p: 2.1e-08 [F] |
 +-- TP: beacon_storm:30000->1200 --------------------------------+
 ```
 
 Each panel shows:
 - **Severity** (color-coded: red=HIGH, yellow=MEDIUM)
 - **Implant ID, group, and config type**
-- **IQR deviations:** Which features are outside fences, with expected range and median
-- **SHAP contributions:** Which features drove the ML score (positive = toward anomalous)
-- **All detector scores:** IF percentile, LOF percentile, Mahalanobis p-value
-- **Ground truth** (green subtitle if this was an injected anomaly)
+- **IQR deviations:** which features are outside fences, with expected range and median
+- **SHAP contributions:** which features drove the IF decision. Sign convention follows IF `decision_function`: **negative** values push toward anomalous, positive values push toward normal. A more-negative SHAP value means a bigger contribution to the anomaly.
+- **Detector votes:** IF percentile + `[FLAGGED]` indicator from `predict()`, LOF percentile + `[FLAGGED]`, Mahalanobis p-value + `[FLAGGED]` when `p < 0.01`
+- **Ground truth** (green subtitle if this was an injected anomaly — the injector tag is shown as proof of a true positive)
 
 ### Summary Table
 
@@ -558,7 +563,7 @@ The PoC uses synthetic data with controlled anomaly injection:
 - All data is clean — no anomalies
 
 **Live phase (with injection):**
-- 10,000 events streamed at maximum speed
+- Up to `LIVE_PHASE_MAX_EVENTS` (default 3,000) events streamed at maximum speed
 - ~4% of events have anomalies injected (controlled by `ANOMALY_RATE`)
 - Each anomalous event is tagged with ground truth (injector name + parameters)
 
@@ -594,12 +599,15 @@ The PoC uses synthetic data with controlled anomaly injection:
 | Metric | Value |
 |---|---|
 | **Detection rate** | 90.0% |
-| **False positive rate** | 23.6% |
-| **Precision** | 76.4% |
+| **False positive rate** | 24.2% |
+| **Precision** | 75.8% |
 | Events scored | 5,000 |
-| Anomalies injected | ~209 |
+| Anomalies injected | 209 |
 | True positives | 188 |
-| False positives | 58 |
+| False positives | 60 |
+| Total alerts fired | 248 |
+
+> Reproducible via `poc/validate_detection.py` — deterministic `random.seed(42)`, no Kafka/Postgres/Redis required.
 
 ### Per-Injector Breakdown
 
@@ -719,7 +727,7 @@ The system detects all 10 anomaly types at 60-100% (90% overall) without any han
 
 ### 2. False Positive Rate Is Controllable
 
-At 23.6% FP rate (76.4% precision), the alert stream is readable. The corroboration requirement between detector families is the key mechanism — it provides structural FP control independent of threshold tuning.
+At 24.2% FP rate (75.8% precision), the alert stream is readable. The corroboration requirement between detector families is the key mechanism — it provides structural FP control independent of threshold tuning.
 
 ### 3. Multi-Algorithm Ensemble Provides Robustness
 
@@ -747,11 +755,11 @@ The component separation (generator to Kafka to ingestor to PostgreSQL/Redis to 
 
 ### Detection Gaps
 
-1. **Binary feature combinations:** Anomalies that only change boolean flags (like enabling all evasion techniques) are hard to detect because each individual flag value appears in normal data. Isolation Forest and LOF struggle with high-dimensional binary spaces. The `full_evasion` injector achieves 0% detection for this reason.
+1. **Binary feature combinations:** Anomalies that only change boolean flags (like enabling all evasion techniques) are hard to detect because each individual flag value appears in normal data. Isolation Forest and LOF struggle with high-dimensional binary spaces. The `full_evasion` injector currently sits at 66.7%, the second-weakest detector rate after `self_destruct_flood` (60.0%); both are correlation-only anomalies where individual features stay within normal ranges.
 
 2. **Subtle correlation violations:** When anomaly feature values overlap heavily with normal data distributions (individual features within range, only the combination is unusual), detection requires very high sample counts (above 1000 per config type) for reliable ML discrimination.
 
-3. **Stochastic variation:** Detection rates vary slightly across runs due to random seed differences in data generation and model training. The reported 82.1% is representative but not exact.
+3. **Stochastic variation:** The reported 90.0% detection rate is exactly reproducible via `validate_detection.py` (which seeds `random.seed(42)`), but is sensitive to algorithm parameters and training window sizes — change `ISOLATION_FOREST_CONTAMINATION` or `BASELINE_WINDOW_SIZE_IMPLANT` and the numbers shift.
 
 ### Operational Gaps
 
@@ -816,16 +824,15 @@ All tunable parameters are centralized in `config.py`:
 | `IQR_SIGNIFICANT_FEATURE_COUNT` | 2 | Feature count threshold for "significant" |
 | `MINIMUM_IQR_DEVIATION` | 0.1 | Minimum deviation to count as "hard" |
 | `ZERO_IQR_EPSILON` | 0.01 | Epsilon band for truly constant features |
-| `ISOLATION_FOREST_ESTIMATORS` | 500 | Number of IF trees |
-| `ISOLATION_FOREST_CONTAMINATION` | 0.02 | Expected anomaly fraction (IF training) |
+| `ISOLATION_FOREST_ESTIMATORS` | 100 | Number of IF trees |
+| `ISOLATION_FOREST_CONTAMINATION` | 0.02 | Expected anomaly fraction — controls `predict()` threshold used for severity voting |
 | `ISOLATION_FOREST_MAX_FEATURES` | 0.8 | Feature subsampling per tree |
-| `ISOLATION_FOREST_HIGH_THRESHOLD` | 0.95 | IF percentile score threshold (display) |
-| `ISOLATION_FOREST_MEDIUM_THRESHOLD` | 0.90 | IF percentile score threshold (display) |
+| `ISOLATION_FOREST_REPORTING_THRESHOLD` | 0.90 | IF percentile threshold used only by the summary layer to count "detected by IF" — does NOT drive severity voting |
 | `LOF_N_NEIGHBORS` | 20 | LOF density estimation neighbors |
-| `LOF_CONTAMINATION` | 0.02 | Expected anomaly fraction (LOF training) |
-| `LOF_HIGH_THRESHOLD` | 0.90 | LOF percentile score threshold (display) |
-| `MAHALANOBIS_P_VALUE_HIGH` | 0.001 | p-value for red color in panel (diagnostic) |
-| `MAHALANOBIS_P_VALUE_MEDIUM` | 0.01 | p-value for yellow color in panel (diagnostic) |
+| `LOF_CONTAMINATION` | 0.02 | Expected anomaly fraction — controls `predict()` threshold used for severity voting |
+| `LOF_REPORTING_THRESHOLD` | 0.90 | LOF percentile threshold used only by the summary layer — does NOT drive severity voting |
+| `MAHALANOBIS_P_VALUE_HIGH` | 0.001 | p-value used for red colouring in alert panels |
+| `MAHALANOBIS_P_VALUE_MEDIUM` | 0.01 | p-value threshold for the Mahalanobis severity vote — `p < 0.01` counts as one ML vote |
 | `SHAP_TOP_N_FEATURES` | 5 | Max SHAP features shown per alert |
 
 ### Baseline Management
@@ -847,7 +854,7 @@ All tunable parameters are centralized in `config.py`:
 | `IMPLANT_GROUPS` | 3 groups x 5 implants | Organizational structure |
 | `BASELINE_DAYS` | 10 | Days of synthetic history |
 | `SNAPSHOTS_PER_IMPLANT_PER_DAY` | 24 | Telemetry frequency |
-| `LIVE_PHASE_MAX_EVENTS` | 10,000 | Total live events before stop |
+| `LIVE_PHASE_MAX_EVENTS` | 3,000 | Total live events before stop |
 
 ---
 
