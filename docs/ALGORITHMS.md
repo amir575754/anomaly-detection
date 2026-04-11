@@ -58,7 +58,7 @@ Unsupervised detection is inherently harder than supervised. Without knowing wha
 - **Some normal data looks unusual** — a legitimate but rare configuration might trigger a false alarm.
 - **Precision matters** — if you alert on everything slightly unusual, operators will ignore the alerts (alert fatigue).
 
-This is why we use multiple algorithms instead of one — they each see different types of "unusual." Three algorithms actively vote on severity (IQR, Isolation Forest, LOF), while a fourth (Mahalanobis distance) provides diagnostic context displayed in alert panels.
+This is why we use multiple algorithms instead of one — they each see different types of "unusual." Four detector families vote on severity: IQR (statistical, per-feature), Isolation Forest (tree-based multivariate), LOF (density-based), and Mahalanobis distance (correlation-aware). See §8 for the exact voting rule.
 
 ---
 
@@ -72,7 +72,7 @@ This is why we use multiple algorithms instead of one — they each see differen
 > - **Correlation structures** (beacon drives jitter/retries/sleep, method count drives registry/task counts, evasion techniques follow a layered dependency chain) are intentional design choices that give the ML models learnable patterns. Real telemetry may have different, weaker, or additional correlations.
 > - **Feature ranges** reflect the generator's clamped random distributions. Real telemetry ranges may be wider, narrower, or multimodal.
 > - **Algorithm parameters** (IQR multiplier=2.0, contamination=0.02, 500 IF trees, etc.) were tuned to perform well on this synthetic data. They will need re-tuning on real data.
-> - **Detection rates** (82.1% detection, 28.9% FP) are measured against synthetic anomalies. Real operator mistakes may be subtler or more diverse.
+> - **Detection rates** (currently 90.0% detection, 24.2% FP, reproducible via `poc/validate_detection.py`) are measured against synthetic anomalies. Real operator mistakes may be subtler or more diverse, and the numbers will shift.
 >
 > When moving to production, the synthetic generator should be replaced by real telemetry, and all thresholds and correlations should be re-evaluated.
 
@@ -408,48 +408,17 @@ For most severity levels, we require at least two detector families to agree. Th
 
 ### Why Not Let Single Detectors Fire Alone?
 
-This is the natural question: if we chose LOF specifically for local outliers that IF misses, why require IF to confirm? Doesn't that defeat the purpose?
+This is the natural question: if we chose LOF specifically for local outliers that IF misses, why require IF (or another family) to confirm? Doesn't that defeat the purpose?
 
-**Yes — partially.** Corroboration is a pragmatic tradeoff, not a theoretically optimal strategy. Here's the measured cost:
+**Yes — partially.** Corroboration is a pragmatic tradeoff, not a theoretically optimal strategy. The cost is measurable: in an earlier validation run against 10,000 events (~377 anomalies, using the pre-Mahalanobis 3-detector ensemble), a handful of true anomalies were caught by exactly one ML model and suppressed because nothing else agreed — concentrated in `duplicated_persistence_setup`, `self_destruct_flood`, and `mismatched_escalation_policy`. In exchange, hundreds of single-ML false positives on clean data were also suppressed. The ratio was roughly **14 false positives filtered out for every 1 true positive lost** — a strongly favourable trade.
 
-In validation against 10,000 events (~377 anomalies):
-- **23 anomalies (6.1%)** are caught by exactly one ML model but suppressed because the other doesn't agree
-- 19 of those are IF-only, 4 are LOF-only
-- They're concentrated in `duplicated_persistence_setup` (13), `self_destruct_flood` (6), and `mismatched_escalation_policy` (4)
+The pattern held across every experimental run: single-ML-predict events were overwhelmingly noise (measured in the low 90s of percent on clean data), while true anomalies almost always triggered multiple detectors. Corroboration filters this noise effectively without losing much signal.
 
-If we removed the corroboration requirement and let single ML predictions through, we would catch those 23 extra anomalies — but we'd also admit:
-- **157 IF-only false positives** on clean data
-- **167 LOF-only false positives** on clean data
-
-That's **324 additional FPs to gain 23 TPs** — a 14:1 FP-to-TP ratio on the marginal detections. The FP rate would jump from 13.6% to roughly 75%.
-
-The table below shows every detection pattern observed:
-
-```
-ANOMALY PATTERNS (what fires on true anomalies):
-  IQR_sig + IF + LOF      75 (19.9%)   → ALERTED (HIGH)
-  IQR_any + IF + LOF      63 (16.7%)   → ALERTED (MEDIUM)
-  IQR_any + IF             63 (16.7%)   → ALERTED (MEDIUM)
-  IQR_sig + LOF            51 (13.5%)   → ALERTED (HIGH)
-  IF + LOF                 36  (9.5%)   → ALERTED (HIGH)
-  IQR_any + LOF            34  (9.0%)   → ALERTED (MEDIUM)
-  none                     31  (8.2%)   → suppressed (no signal at all)
-  IF only                  19  (5.0%)   → suppressed (no corroboration)
-  LOF only                  4  (1.1%)   → suppressed (no corroboration)
-
-FALSE POSITIVE PATTERNS (what fires on clean data):
-  IQR_any only            209           → suppressed
-  LOF only                167           → suppressed
-  IF only                 157           → suppressed
-  IF + LOF                 34           → ALERTED (FP)
-  IQR_any + IF             31           → ALERTED (FP)
-```
-
-The data shows that single-ML-predict events are **overwhelmingly false positives** (157+167 clean vs 19+4 anomalous = 93% noise). Corroboration filters this noise effectively.
+> The specific pattern tables previously documented here (absolute counts per pattern) were computed against an older 10,000-event run with a different ensemble configuration and are no longer reproducible against the current code. The *directional* finding — "single-ML events are ~93% noise" — still holds and is the basis of the design choice. The current headline numbers (90.0% detection, 24.2% FP) come from `poc/validate_detection.py`.
 
 ### The Design Choice
 
-We accepted ~6% missed anomalies to keep the FP rate under 15%. This is appropriate for a system where **alert fatigue is a bigger operational risk than missing a subtle anomaly** — an operator who ignores alerts because most are false is worse off than one who occasionally misses a marginal detection.
+We accept some missed anomalies to keep the FP rate manageable. The current measured numbers — 188 TP / 60 FP / 21 missed on 5000 events with 209 injected — give a 90.0% detection rate and 24.2% FP rate, which is well inside the targets set out in §12 of SYSTEM_OVERVIEW.md. This is appropriate for a system where **alert fatigue is a bigger operational risk than missing a subtle anomaly** — an operator who ignores alerts because most are false is worse off than one who occasionally misses a marginal detection.
 
 If a future use case demands higher recall at the cost of precision, the corroboration can be relaxed:
 - **Option A:** Let single ML predictions through as LOW severity (separate triage queue)
@@ -458,16 +427,17 @@ If a future use case demands higher recall at the cost of precision, the corrobo
 
 ### How predict() Reduces False Positives
 
-Instead of using continuous anomaly scores with thresholds (where 10% of clean data scores above the 90th percentile by definition), we use sklearn's `predict()` method for the IF and LOF severity votes. `predict()` produces a binary yes/no decision calibrated to the contamination rate.
+Instead of using continuous anomaly scores with thresholds (where 10% of clean data scores above the 90th percentile by definition), we use sklearn's `predict()` method for the IF and LOF severity votes. `predict()` produces a binary yes/no decision calibrated to the contamination rate. Mahalanobis casts its vote via a p-value cutoff (`p < MAHALANOBIS_P_VALUE_MEDIUM`, default 0.01), which has the same "fraction of normal data flagged" interpretation.
 
-Note: the system also computes continuous percentile scores for both IF and LOF (via the empirical CDF of training scores). These are displayed in alert panels for operator context. But the **severity voting** uses only the binary `predict()` output, not the continuous scores.
+Note: the system also computes continuous percentile scores for IF and LOF (via the empirical CDF of training scores). These are displayed in alert panels for operator context and counted by the summary-reporting layer. But the **severity voting** uses only the binary `predict()` outputs and the p-value threshold, not the continuous scores. The `*_REPORTING_THRESHOLD` config constants affect only reporting counts, not severity decisions.
 
-With `contamination=0.02`:
+With `ISOLATION_FOREST_CONTAMINATION = LOF_CONTAMINATION = 0.02`:
 - IF's `predict()` flags ~2% of training data as anomalous
 - LOF's `predict()` flags ~2% of training data as anomalous
-- The probability of BOTH independently flagging the same clean data point is ~0.04% (assuming independence)
+- Mahalanobis `p < 0.01` flags ~1% of normal data by construction
+- The probability of any two of these three independently flagging the same clean data point is approximately 0.04% (assuming independence)
 
-This gives us a structural FP guarantee: **requiring both ML models to agree limits ML-driven false positives to <0.1% of clean events.**
+This gives us a structural FP guarantee: **requiring at least two ML families to agree limits ML-driven false positives to a fraction of a percent of clean events, before IQR corroboration further tightens it.**
 
 ### Severity Voting Rules
 
@@ -493,12 +463,15 @@ Detecting that something is anomalous is only half the job. Operators need to kn
 
 SHAP computes the contribution of each feature to the Isolation Forest's anomaly score. It answers: "How much did each feature push the prediction toward anomalous vs. normal?"
 
+**Sign convention.** IF's `decision_function` returns lower values for more-anomalous points, so SHAP contributions follow the same convention: **negative contributions push toward anomalous**, positive contributions push toward normal. More-negative = bigger contribution to the anomaly. The consumers (`detection/output.py`, `detection/summary.py`, and the `ShapContribution` dataclass in `detection/models.py`) all rely on this convention — do not flip it without flipping every consumer.
+
 For example, for a detected beacon_storm:
 ```
 Feature Contributions:
-  beacon_interval_ms    → +0.928 (strong push toward anomalous)
-  jitter_percentage     → +0.340 (moderate push)
-  c2_channel_count      → -0.050 (slight push toward normal)
+  beacon_interval_ms    → -0.928 (dominant push toward anomalous)
+  sleep_on_failure_ms   → -0.367 (secondary push toward anomalous)
+  jitter_percentage     → -0.012 (negligible)
+  c2_channel_count      → +0.050 (slight push toward normal)
 ```
 
 ### How It Works (Simplified)

@@ -84,7 +84,7 @@ poc/
 | Component | Technology |
 |-----------|------------|
 | All application code | Python |
-| Detection models | `scikit-learn` (Isolation Forest + IQR) |
+| Detection models | `scikit-learn` (Isolation Forest + LocalOutlierFactor), `scipy` (Mahalanobis via covariance), plus IQR (implemented directly) |
 | Explainability | `shap` (TreeExplainer for per-feature IF attribution) |
 | Kafka client | `confluent-kafka` |
 | PostgreSQL client | `psycopg2` |
@@ -204,50 +204,67 @@ During the cold-start period for a given implant, only the group baseline is use
 
 ### Detection Models
 
-Two models run in parallel on each feature vector.
+Four detector families run in parallel on each feature vector. Each one catches a different kind of anomaly; severity is decided by how many agree (see Severity Scoring).
 
 **IQR detector (statistical, per-feature):**
 - For each feature, compute Q1, Q3, and IQR from the baseline window
 - Flag the feature if the observed value falls outside `[Q1 - k*IQR, Q3 + k*IQR]` where `k` is configurable via `IQR_MULTIPLIER` in `config.py`
-- Fences are clamped at P1/P99 of the training data to prevent fences extending into impossible ranges for narrow-distribution features
-- IQR is robust to outliers and makes no assumptions about the underlying distribution
+- Fences are unclamped by design — allowing them to extend into theoretically impossible ranges is harmless, and clamping at P1/P99 was found to halve true positives on narrow-distribution features (removed in commit 48e5317)
+- When IQR is zero (constant/boolean features), the implementation falls back to MAD-based fences or a tight epsilon band around the median
+- Robust to outliers and makes no distributional assumptions
 - Produces per-feature deviation scores — the primary source of explainability
 
 **Isolation Forest (multivariate):**
-- Trained on StandardScaler-normalized feature vectors for each (baseline scope, config type) combination
+- Trained on `StandardScaler`-normalized feature vectors for each (baseline scope, config type) combination
 - Catches anomalies that are subtle across multiple features but not extreme on any single one
-- One `TrainedModel` instance per (scope, config type) pair, serialised and cached in Redis
-- SHAP `TreeExplainer` attached to each trained model for per-feature anomaly attribution
-- Retrained whenever the baseline window is refreshed
+- Severity voting uses `predict()` calibrated to `ISOLATION_FOREST_CONTAMINATION`, not a percentile threshold — this gives a structural FP bound
+- SHAP `TreeExplainer` attached to each trained model for per-feature anomaly attribution (sign convention: **negative** contribution = push toward anomalous, matching IF `decision_function` semantics)
 
-Both detectors must independently signal anomalous for a HIGH detection. Either alone produces MEDIUM or LOW (see Severity Scoring).
+**Local Outlier Factor (density-based):**
+- Trained in `novelty=True` mode with `LOF_N_NEIGHBORS` neighbors and `LOF_CONTAMINATION` calibration
+- Flags points whose local density is much lower than their neighbors' — catches points that are unusual *for their cluster* even if not globally extreme
+- Per-implant baselines benefit most from LOF (tight clusters expose drift the group baseline tolerates)
+
+**Mahalanobis distance (correlation-aware):**
+- Learned from the training covariance matrix with a small regularizer to stay invertible when features > samples
+- Catches configs where each feature is individually within its normal range but the *joint* combination breaks an expected correlation
+- Reports a p-value; `p < MAHALANOBIS_P_VALUE_MEDIUM` (0.01) counts as one vote in the severity rule
+
+All four detectors live on the same `TrainedModel` instance per (scope, config type) pair, serialised and cached in Redis. The baseline is retrained whenever the sliding window grows by more than `RETRAIN_THRESHOLD` new entries since the last training.
 
 ### Severity Scoring
 
+The severity decision is made in `determine_severity()` (`detection/scoring.py`). Let `ml_votes = if_predicts_anomaly + lof_predicts_anomaly + (mahalanobis_p < 0.01)`.
+
 | Level | Criteria |
 |-------|----------|
-| **HIGH** | Both detectors agree: IQR shows significant deviation (multiple features or extreme single-feature breach) AND Isolation Forest score exceeds the high threshold. |
-| **MEDIUM** | IQR flagged at least one feature deviation. |
-| **LOW** | IF score exceeds the high threshold, no IQR breach. SHAP contributions explain which features drove the IF decision. |
+| **HIGH** | IQR shows significant deviation (2+ deviating features or a deviation above `IQR_SIGNIFICANT_MULTIPLIER` IQR units) AND at least one ML vote, **OR** two or more ML families (IF / LOF / Mahalanobis) independently agree. |
+| **MEDIUM** | IQR significant alone, **OR** IQR flagged any deviation AND at least one ML family corroborates. |
+| *(suppressed)* | Everything else — not printed to the CLI. A single ML vote without any IQR evidence is intentionally dropped because measured single-detector alerts were ~93% noise. |
 
-All thresholds (`IQR_SIGNIFICANT_FEATURE_COUNT`, `IQR_SIGNIFICANT_MULTIPLIER`, `ISOLATION_FOREST_HIGH_THRESHOLD`, `ISOLATION_FOREST_MEDIUM_THRESHOLD`) are constants in `config.py`.
+Severity voting uses sklearn's `predict()` for IF and LOF — **not** a percentile-score threshold. The `*_REPORTING_THRESHOLD` constants in `config.py` are used only by the summary-reporting layer (`detection/summary.py`) to count "how many detections came from family X", not by severity voting.
+
+Key tunables in `config.py`: `IQR_MULTIPLIER`, `IQR_SIGNIFICANT_FEATURE_COUNT`, `IQR_SIGNIFICANT_MULTIPLIER`, `ISOLATION_FOREST_CONTAMINATION`, `LOF_CONTAMINATION`, `MAHALANOBIS_P_VALUE_MEDIUM`.
 
 ### CLI Output Format
 
-Detected anomalies are printed directly to the detector's stdout:
+Detected anomalies are printed as `rich` panels by `detection/output.py`. Each panel shows the severity, implant+group+config type header, IQR deviations with expected ranges, SHAP contributions (negative = anomalous), and the four detector votes:
 
 ```
-[HIGH] implant_ALPHA_003 (ALPHA) communication_configuration
-  ├─ IQR: beacon_interval_ms = 1200 (expected 25000–35000, median 30100)
-  ├─ IQR: jitter_percentage = 0.0 (expected 0.10–0.25, median 0.18)
-  └─ IF score: 0.987
-
-[LOW] implant_BRAVO_002 (BRAVO) communication_configuration
-  ├─ SHAP: beacon_interval_ms (-0.928), c2_enabled_count (-0.368), jitter_percentage (-0.340)
-  └─ IF score: 0.734
+┌── HIGH implant_ALPHA_003 (ALPHA) communication_configuration ──┐
+│  IQR Deviations [FLAGGED]                                       │
+│    beacon_interval_ms  1200  (expected 17000-43000, median 29900)│
+│    jitter_percentage   0.00  (expected 0.10-0.25, median 0.18) │
+│  SHAP Contributions:                                            │
+│    beacon_interval_ms  -0.623  anomalous                        │
+│    sleep_on_failure_ms -0.367  anomalous                        │
+│  IF:  0.995 [FLAGGED]                                           │
+│  LOF: 1.000 [FLAGGED]                                           │
+│  Mahal p: 0.0e+00 [FLAGGED]                                     │
+└──────────────── TP: beacon_storm ──────────────────────────────┘
 ```
 
-Only events with IQR evidence or a strong IF signal (above `ISOLATION_FOREST_HIGH_THRESHOLD`) are printed. MEDIUM events without IQR deviations are suppressed to keep the CLI readable.
+Events below the alert threshold (severity `None`) are suppressed to keep the CLI readable.
 
 ### Detection Loop
 
